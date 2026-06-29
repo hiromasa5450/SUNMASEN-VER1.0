@@ -1,0 +1,3291 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<!-- ① ビューポート固定：ユーザーによるスケール操作を禁止（設計書 15.1） -->
+<meta name="viewport"
+  content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>スンマ戦</title>
+<style>
+  /* ② html/body レベルでタッチ操作を制御（設計書 15.1） */
+  /* body自体を固定し、アドレスバー開閉によるスクロール／ずり上がりを根本封じ */
+  html, body {
+    margin: 0; padding: 0;
+    position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+    width: 100%; height: 100%;
+    background: #0a0a12;
+    touch-action: none;            /* ブラウザ既定のパン・ズームを無効化 */
+    overscroll-behavior: none;     /* バウンススクロール（iOS）も無効化 */
+    -webkit-user-select: none;     /* テキスト選択によるズームを防止 */
+    user-select: none;
+    overflow: hidden;              /* スクロールバーを非表示 */
+    -webkit-tap-highlight-color: transparent;
+    font-family: "Hiragino Kaku Gothic ProN", "Yu Gothic", sans-serif;
+  }
+  /* 100dvh で実表示領域に追従（アドレスバーを考慮した高さ） */
+  #wrap { position: fixed; top: 0; left: 0; width: 100%; height: 100vh; height: 100dvh;
+          display: flex; align-items: flex-start; justify-content: center;
+          overflow-y: auto; overflow-x: hidden; -webkit-overflow-scrolling: touch; }
+  /* ③ ゲームCanvas自体にも念のため設定（設計書 15.1） */
+  canvas {
+    touch-action: none;
+    display: block;
+    background: #1a2238;
+    max-width: 100%; max-height: 100%;
+  }
+  /* 縦画面の案内：操作を妨げない上部バナー（全画面で覆わない） */
+  #rotate {
+    position: fixed; top: 0; left: 0; right: 0; display: none;
+    align-items: center; justify-content: center; padding: 8px 6px;
+    background: rgba(10,10,18,0.85); color: #ffd166; font-size: 15px; text-align: center;
+    z-index: 10; pointer-events: none;
+  }
+  @media (orientation: portrait) and (max-width: 900px) {
+    #rotate { display: flex; }
+  }
+</style>
+</head>
+<body>
+  <div id="wrap"><canvas id="game" width="1280" height="720"></canvas></div>
+  <div id="rotate">📱 横向きにするとより遊びやすくなります</div>
+
+<script>
+/* ④⑤ ダブルタップ／ピンチズームを preventDefault で完全遮断（設計書 15.1） */
+document.addEventListener('touchstart', (e) => { if (e.touches.length > 1) e.preventDefault(); }, { passive: false });
+document.addEventListener('touchmove', (e) => {
+  // data-scroll を持つUI（リクエスト一覧など）内ではスクロールを許可
+  if (e.target && e.target.closest && e.target.closest('[data-scroll]')) return;
+  e.preventDefault();
+}, { passive: false });
+let __lastTouchEnd = 0;
+document.addEventListener('touchend', (e) => {
+  const now = Date.now();
+  if (now - __lastTouchEnd < 300) e.preventDefault();
+  __lastTouchEnd = now;
+}, { passive: false });
+document.addEventListener('gesturestart', (e) => e.preventDefault());
+document.addEventListener('contextmenu', (e) => e.preventDefault());
+
+/* ⑥ 何らかの理由でページがスクロールしても常に最上部へ引き戻す（横画面のずり上がり防止） */
+function __pinTop() { if (window.scrollX || window.scrollY) window.scrollTo(0, 0); }
+window.addEventListener('scroll', __pinTop, { passive: true });
+window.addEventListener('orientationchange', () => setTimeout(__pinTop, 250));
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('scroll', __pinTop);
+  window.visualViewport.addEventListener('resize', __pinTop);
+}
+setInterval(__pinTop, 500);
+
+/* ⑦ スマホ横画面：最初のタッチでフルスクリーン化し、ブラウザのツールバーを隠す
+   （Android Chrome / iPad で有効。iPhone Safari は element 全画面非対応 → ホーム画面追加で全画面に） */
+let __fsTried = false;
+function __tryFullscreen() {
+  if (__fsTried) return; __fsTried = true;
+  const el = document.documentElement;
+  const fn = el.requestFullscreen || el.webkitRequestFullscreen || el.mozRequestFullScreen || el.msRequestFullscreen;
+  if (fn) { try { const p = fn.call(el); if (p && p.catch) p.catch(() => {}); } catch (e) {} }
+}
+if ('ontouchstart' in window) {
+  window.addEventListener('touchend', __tryFullscreen, { passive: true });
+}
+</script>
+<!-- ネット対戦（任意）：Firebase設定があれば有効化。未設定ならローカルCPU対戦にフォールバック -->
+<script>
+/* =========================================================================
+ *  スンマ戦 — ネット対戦レイヤー（任意）  Firebase Realtime Database
+ *  設計書 3.3「対戦モード（部屋作成・参加）」/ 15「ネットワーク」/ 17.3「カラー被り同期」
+ *
+ *  ■ これは「任意」モジュールです。
+ *    FIREBASE_CONFIG が null のままなら Net.available() === false となり、
+ *    game.js は自動的にローカルCPU対戦へフォールバックします（今すぐ遊べます）。
+ *
+ *  ■ オンライン対戦を有効化する手順
+ *    1) https://console.firebase.google.com/ でプロジェクト作成
+ *    2) Realtime Database を作成（テスト用ルールでOK：開発中のみ）
+ *    3) 「ウェブアプリ」を登録して構成オブジェクトを下の FIREBASE_CONFIG に貼り付け
+ *    4) ページを開くと対戦モードで部屋作成/参加が使えるようになります
+ *
+ *  ■ 同期方式：ホスト権限（host-authoritative）
+ *    - 部屋ホストがゲーム本体（World）をシミュレーションし、各キャラの状態を
+ *      ブロードキャスト。参加者は自分の入力を送信し、受信状態を描画します。
+ *    - RTDB はロビー・キャラ選択・部屋管理に最適。試合中の物理同期は
+ *      レイテンシの影響を受けるベストエフォートです（LAN/近距離で良好）。
+ * ========================================================================= */
+
+// ▼▼▼ ここに Firebase の構成を貼り付けると有効化されます ▼▼▼
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyByYFg2o6TcRRtLFt4xfHaPOzzUGDg2pRw",
+  authDomain: "tps-game-817dc.firebaseapp.com",
+  databaseURL: "https://tps-game-817dc-default-rtdb.firebaseio.com",
+  projectId: "tps-game-817dc",
+  storageBucket: "tps-game-817dc.firebasestorage.app",
+  messagingSenderId: "538488947638",
+  appId: "1:538488947638:web:e2b13d0c3ba5245c293717",
+  measurementId: "G-2PDE3LRXMK"
+};
+/* 例:
+const FIREBASE_CONFIG = {
+  apiKey: "xxxx",
+  authDomain: "xxxx.firebaseapp.com",
+  databaseURL: "https://xxxx-default-rtdb.firebaseio.com",
+  projectId: "xxxx",
+  appId: "1:xxxx:web:xxxx",
+};
+*/
+
+window.Net = (function () {
+  let db = null, ready = false, me = null, roomCode = null, roomRef = null, isHost = false;
+  let overlay = null, gameRef = null;
+  let playersRef = null, stateRef = null, inputsRef = null, snapshotRef = null;
+  let selectedStage = 0;   // ホストが選んだステージ（ロビーで設定）
+  let lastPlayers = {};    // 直近のロビー参加者（ステージ選択時の再描画用）
+  // WebRTC（P2P）：試合中の入力/スナップショットをピア直結で流す。失敗時はRTDB中継にフォールバック
+  const RTC_CFG = { iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+  ] };
+  let peers = {};          // ホスト：clientPid -> { pc, ch, open, pend:[] , remoteSet }
+  let hostPeer = null;     // クライアント：ホストとの接続
+  let inputsMap = {};      // ホスト：pid -> 最新入力（チャネル/RTDB混在対応）
+  let snapCb = null, inputsCb = null;
+  let reqListRef = null;   // キャラリクエスト一覧の購読
+
+  function available() { return !!FIREBASE_CONFIG; }
+
+  // Firebase SDK（compat）を動的ロード
+  function loadSDK() {
+    return new Promise((resolve, reject) => {
+      if (window.firebase && firebase.database) return resolve();
+      const a = document.createElement('script');
+      a.src = 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js';
+      a.onload = () => {
+        const b = document.createElement('script');
+        b.src = 'https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js';
+        b.onload = resolve; b.onerror = reject;
+        document.head.appendChild(b);
+      };
+      a.onerror = reject;
+      document.head.appendChild(a);
+    });
+  }
+
+  async function ensure() {
+    if (ready) return;
+    await loadSDK();
+    firebase.initializeApp(FIREBASE_CONFIG);
+    db = firebase.database();
+    me = 'p_' + Math.random().toString(36).slice(2, 8);
+    ready = true;
+  }
+
+  function gen4() { return String(Math.floor(1000 + Math.random() * 9000)); }
+
+  // ---- 簡易DOMオーバーレイ（部屋作成/参加・待機ロビー：設計書 3.3） ----
+  function showOverlay(html) {
+    if (!overlay) {
+      overlay = document.createElement('div');
+      overlay.style.cssText = 'position:fixed;inset:0;display:flex;align-items:flex-start;justify-content:center;background:rgba(8,10,20,0.92);color:#fff;z-index:50;font-family:sans-serif;text-align:center;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:24px 0;box-sizing:border-box;';
+      overlay.setAttribute('data-scroll', '');   // 内容がはみ出してもスクロールできるように
+      document.body.appendChild(overlay);
+    }
+    overlay.innerHTML = html;
+    overlay.style.display = 'flex';
+  }
+  function hideOverlay() { if (overlay) overlay.style.display = 'none'; }
+
+  async function openRoomUI(Game) {
+    gameRef = Game;
+    try { await ensure(); } catch (e) { alert('Firebase接続に失敗しました。ローカル対戦に切替えます。'); Game.mode = 'versus'; Game.scene = 'charselect'; Game.resetSelect(); return; }
+    menu();
+  }
+
+  // ===== キャラリクエスト（みんな共通の掲示板）=====
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+  async function openRequestUI(Game) {
+    gameRef = Game;
+    try { await ensure(); } catch (e) { alert('Firebaseに接続できませんでした'); return; }
+    requestMenu();
+  }
+  function closeRequest() { if (reqListRef) { reqListRef.off(); reqListRef = null; } hideOverlay(); if (gameRef) gameRef.scene = 'title'; }
+  function requestMenu() {
+    showOverlay(`
+      <div style="max-width:560px;width:92%;text-align:left;">
+        <h1 style="font-size:32px;margin:0 0 4px;text-align:center;">📝 キャラリクエスト</h1>
+        <div style="color:#9fb3d1;font-size:13px;text-align:center;margin-bottom:12px;">追加してほしいキャラの名前と性能を書いてね。開発者が見て制作します！</div>
+        <input id="cr-name" maxlength="30" placeholder="キャラ名（例：ninja）" style="${INP2}">
+        <textarea id="cr-perf" maxlength="300" placeholder="性能・能力（例：移動が速い／4段ジャンプ／〇〇できる…）" style="${TXT}"></textarea>
+        <button id="cr-submit" style="${BTN}">リクエストを送信</button>
+        <div style="color:#9fb3d1;font-size:14px;margin:14px 0 6px;">みんなのリクエスト</div>
+        <div id="cr-list" data-scroll style="max-height:34vh;overflow-y:auto;-webkit-overflow-scrolling:touch;touch-action:pan-y;background:#141c30;border-radius:10px;padding:8px;"></div>
+        <div style="text-align:center;"><button id="cr-close" style="${BTN2}">閉じる</button></div>
+      </div>`);
+    reqListRef = db.ref('charRequests');
+    reqListRef.limitToLast(50).on('value', (s) => renderReqList(s.val() || {}),
+      () => { const el = document.getElementById('cr-list'); if (el) el.innerHTML = '<div style="color:#ff8080;">一覧を読み込めません（Firebaseルールで charRequests の読み取りを許可してください）</div>'; });
+    document.getElementById('cr-submit').onclick = async () => {
+      const name = document.getElementById('cr-name').value.trim();
+      const perf = document.getElementById('cr-perf').value.trim();
+      if (!name) { alert('キャラ名を入力してください'); return; }
+      try {
+        await db.ref('charRequests').push({ name: name.slice(0, 30), perf: perf.slice(0, 300), by: me, ts: Date.now() });
+        document.getElementById('cr-name').value = ''; document.getElementById('cr-perf').value = '';
+      } catch (e) { alert('送信に失敗しました。Firebaseルールで charRequests の書き込みを許可してください。'); }
+    };
+    document.getElementById('cr-close').onclick = closeRequest;
+  }
+  function renderReqList(obj) {
+    const items = Object.values(obj).sort((a, b) => (b.ts || 0) - (a.ts || 0));
+    const el = document.getElementById('cr-list'); if (!el) return;
+    el.innerHTML = items.length ? items.map(r => {
+      const d = r.ts ? new Date(r.ts) : null;
+      const ds = d ? (d.getMonth() + 1) + '/' + d.getDate() : '';
+      return `<div style="background:#1d2840;border-radius:8px;padding:8px 10px;margin:6px 0;">
+        <div style="display:flex;justify-content:space-between;"><b style="color:#ffd166;">${esc(r.name)}</b><span style="color:#6b7a99;font-size:12px;">${ds}</span></div>
+        ${r.perf ? `<div style="color:#cfd8e8;font-size:13px;white-space:pre-wrap;margin-top:2px;">${esc(r.perf)}</div>` : ''}</div>`;
+    }).join('') : '<div style="color:#9fb3d1;padding:8px;">まだリクエストはありません。最初の1件を書いてみよう！</div>';
+  }
+
+  function menu() {
+    showOverlay(`
+      <div style="max-width:480px;">
+        <h1 style="font-size:40px;margin:0 0 24px;">対戦モード</h1>
+        <button id="net-create" style="${BTN}">部屋を作成</button>
+        <div style="margin:18px 0;color:#9fb3d1;">または</div>
+        <input id="net-code" inputmode="numeric" maxlength="4" placeholder="4桁コード" style="${INP}">
+        <button id="net-join" style="${BTN}">部屋に参加</button>
+        <div><button id="net-back" style="${BTN2}">← タイトルへ</button></div>
+      </div>`);
+    document.getElementById('net-create').onclick = createRoom;
+    document.getElementById('net-join').onclick = () => {
+      const c = document.getElementById('net-code').value.trim();
+      if (/^\d{4}$/.test(c)) joinRoom(c); else alert('4桁の数字を入力してください');
+    };
+    document.getElementById('net-back').onclick = () => { hideOverlay(); gameRef.scene = 'title'; };
+  }
+
+  async function createRoom() {
+    isHost = true;
+    // 衝突しないコードを探す
+    for (let tries = 0; tries < 10; tries++) {
+      const code = gen4();
+      const snap = await db.ref('rooms/' + code).get();
+      if (!snap.exists()) {
+        roomCode = code; roomRef = db.ref('rooms/' + code);
+        await roomRef.set({ host: me, state: 'lobby', created: Date.now() });
+        await joinPresence();
+        lobby();
+        return;
+      }
+    }
+    alert('部屋作成に失敗しました');
+  }
+
+  async function joinRoom(code) {
+    const snap = await db.ref('rooms/' + code).get();
+    if (!snap.exists()) { alert('部屋が見つかりません'); return; }
+    if (snap.val().state !== 'lobby') { alert('この部屋は既に開始済みです'); return; }
+    const players = (await db.ref('rooms/' + code + '/players').get()).val() || {};
+    if (Object.keys(players).length >= 4) { alert('満員です（最大4人）'); return; }
+    isHost = false; roomCode = code; roomRef = db.ref('rooms/' + code);
+    await joinPresence();
+    lobby();
+  }
+
+  async function joinPresence() {
+    const D = window.SunmaData;
+    const players = (await roomRef.child('players').get()).val() || {};
+    const n = Object.keys(players).length;
+    const used = Object.values(players).map(p => p.color);
+    let color = 0; for (let c = 0; c < 8; c++) { if (used.indexOf(c) < 0) { color = c; break; } }
+    const pRef = roomRef.child('players/' + me);
+    await pRef.set({ id: me, char: D.CHAR_ORDER[n % D.CHAR_ORDER.length], color: color, joined: Date.now() });
+    pRef.onDisconnect().remove();
+    roomRef.child('inputs/' + me).onDisconnect().remove();
+  }
+
+  function lobby() {
+    playersRef = roomRef.child('players');
+    playersRef.on('value', (snap) => renderLobby(snap.val() || {}));
+    stateRef = roomRef.child('state');
+    stateRef.on('value', async (snap) => {
+      const st = snap.val();
+      if (st === 'playing' && gameRef.scene !== 'countdown' && gameRef.scene !== 'battle') {
+        const m = (await roomRef.child('match').get()).val();
+        const stg = (await roomRef.child('match_stage').get()).val() || 0;
+        if (m) { hideOverlay(); setupRTC(m); gameRef.startNetMatch(m, me, isHost, stg); }
+      } else if (st === 'lobby' && (gameRef.scene === 'battle' || gameRef.scene === 'result' || gameRef.scene === 'countdown')) {
+        // ホストが「キャラ選択へ戻る」を押した → 全員ロビーへ
+        showLobbyNow();
+      }
+    });
+  }
+
+  // 結果画面などからロビー（キャラ/カラー選択）へ戻る
+  async function showLobbyNow() {
+    if (!roomRef) { if (gameRef) gameRef.scene = 'title'; return; }
+    teardownRTC();
+    const players = (await roomRef.child('players').get()).val() || {};
+    renderLobby(players);
+    if (gameRef) { gameRef.scene = 'room'; if (gameRef.world) gameRef.world.netRole = null; }
+  }
+  function returnToLobby() {
+    if (!roomRef) { if (gameRef) gameRef.scene = 'title'; return; }
+    if (isHost) {
+      // ホストは試合データを掃除し、部屋をロビー状態へ戻す（全員が連動して戻る）
+      roomRef.child('match').remove();
+      roomRef.child('snapshot').remove();
+      roomRef.child('inputs').remove();
+      roomRef.child('rtc').remove();
+      roomRef.child('state').set('lobby');
+    }
+    showLobbyNow();
+  }
+
+  function renderLobby(players) {
+    lastPlayers = players;
+    const D = window.SunmaData;
+    const entries = Object.entries(players).sort((a, b) => (a[1].joined || 0) - (b[1].joined || 0));
+    const myP = players[me] || {};
+    const rows = entries.map(([id, p], i) => {
+      const col = (D.COLORS[p.color] && D.COLORS[p.color].std) || '#fff';
+      const cd = D.CHARS[p.char] || {};
+      const nm = cd.name || p.char;
+      // 自分の枠には、選んだキャラの説明を名前の下に軽く表示
+      const desc = (id === me && cd.desc) ? `<div style="font-size:13px;color:#9fb3d1;margin-top:2px;">${cd.desc}</div>` : '';
+      return `<div style="margin:6px 0;">
+        <div style="display:flex;align-items:center;gap:10px;justify-content:center;">
+          <span style="width:14px;height:14px;border-radius:50%;background:${col};display:inline-block;"></span>
+          <b>${id === me ? 'あなた' : 'P' + (i + 1)}</b> — ${nm}</div>
+        ${desc}</div>`;
+    }).join('');
+    const charBtns = D.CHAR_ORDER.map((cid) =>
+      `<button data-char="${cid}" style="${SEL}${myP.char === cid ? 'outline:3px solid #ffd166;background:#3a6ea5;' : ''}">${D.CHARS[cid].name}</button>`).join('');
+    const colBtns = D.COLORS.map((c, i) =>
+      `<button data-col="${i}" style="width:32px;height:32px;border-radius:50%;border:${myP.color === i ? '3px solid #fff' : '2px solid #222'};background:${c.std};margin:3px;cursor:pointer;"></button>`).join('');
+    const stageSel = isHost
+      ? `<div style="color:#9fb3d1;font-size:14px;margin-top:8px;">ステージ（ホストが選択）</div>
+         <div style="display:flex;flex-wrap:wrap;justify-content:center;gap:4px;margin:4px 0;">${
+           D.STAGES.map((s, i) => `<button data-stage="${i}" style="${SEL}${selectedStage === i ? 'outline:3px solid #ffd166;background:#3a6ea5;' : ''}">${s.name}</button>`).join('')}</div>`
+      : `<div style="color:#9fb3d1;font-size:14px;margin-top:8px;">ステージはホストが選びます（${(D.STAGES[selectedStage] || D.STAGES[0]).name}）</div>`;
+    showOverlay(`
+      <div style="max-width:560px;width:92%;">
+        <h2 style="margin:0;">部屋コード</h2>
+        <div style="font-size:56px;letter-spacing:10px;font-weight:bold;color:#ffd166;">${roomCode}</div>
+        <div style="color:#9fb3d1;margin:6px 0 10px;">2〜4人 / 友達にコードを共有</div>
+        <div style="background:#1d2840;border-radius:12px;padding:10px;margin-bottom:10px;">${rows}</div>
+        <div style="color:#9fb3d1;font-size:14px;">あなたのキャラ</div>
+        <div style="display:flex;flex-wrap:wrap;justify-content:center;gap:4px;margin:4px 0;">${charBtns}</div>
+        <div style="color:#9fb3d1;font-size:14px;">カラー</div>
+        <div style="display:flex;flex-wrap:wrap;justify-content:center;">${colBtns}</div>
+        ${stageSel}
+        ${isHost ? `<button id="net-start" style="${BTN}">試合開始（2〜4人）</button>`
+                 : `<div style="margin-top:14px;color:#9fb3d1;">ホストの開始を待っています…</div>`}
+        <div><button id="net-leave" style="${BTN2}">退出</button></div>
+      </div>`);
+    overlay.querySelectorAll('[data-char]').forEach(b =>
+      b.onclick = () => roomRef.child('players/' + me + '/char').set(b.getAttribute('data-char')));
+    overlay.querySelectorAll('[data-col]').forEach(b =>
+      b.onclick = () => roomRef.child('players/' + me + '/color').set(+b.getAttribute('data-col')));
+    if (isHost) {
+      overlay.querySelectorAll('[data-stage]').forEach(b =>
+        b.onclick = () => { selectedStage = +b.getAttribute('data-stage'); renderLobby(lastPlayers); });
+      const s = document.getElementById('net-start'); if (s) s.onclick = hostStart;
+    }
+    document.getElementById('net-leave').onclick = leave;
+  }
+
+  async function hostStart() {
+    const players = (await roomRef.child('players').get()).val() || {};
+    const entries = Object.entries(players).sort((a, b) => (a[1].joined || 0) - (b[1].joined || 0));
+    if (entries.length < 2) { alert('2人以上で開始できます'); return; }
+    if (entries.length > 4) { alert('最大4人です'); return; }
+    const match = entries.map(([id, p]) => ({ pid: id, char: p.char, color: p.color }));
+    await roomRef.child('inputs').remove();
+    await roomRef.child('snapshot').remove();
+    await roomRef.child('rtc').remove();       // シグナリングをクリーンに
+    await roomRef.child('match').set(match);
+    await roomRef.child('match_stage').set(selectedStage);   // ホストが選んだステージを全員へ
+    await roomRef.child('state').set('playing');
+  }
+
+  async function leave() {
+    teardownRTC();
+    try {
+      if (playersRef) playersRef.off();
+      if (stateRef) stateRef.off();
+      if (inputsRef) inputsRef.off();
+      if (snapshotRef) snapshotRef.off();
+      if (roomRef) {
+        await roomRef.child('players/' + me).remove();
+        await roomRef.child('inputs/' + me).remove();
+        if (isHost) await roomRef.remove();   // ホスト退出で部屋ごと解散
+      }
+    } catch (e) {}
+    playersRef = stateRef = inputsRef = snapshotRef = null; roomRef = null;
+    hideOverlay(); if (gameRef) gameRef.scene = 'title';
+  }
+
+  /* ===== WebRTC P2P 接続（Firebaseはシグナリングのみ） ===== */
+  function sigRef(pid) { return roomRef.child('rtc/' + pid); }
+
+  // 試合開始時に呼ぶ：ホストは各クライアントへ、クライアントはホストへ接続
+  function setupRTC(match) {
+    if (!roomRef || !window.RTCPeerConnection) return;
+    teardownRTC();
+    if (isHost) {
+      const clientPids = Object.values(match).map(m => m.pid).filter(pid => pid !== me);
+      clientPids.forEach(pid => hostConnect(pid));
+    } else {
+      clientConnect();
+    }
+  }
+
+  function hostConnect(pid) {
+    const pc = new RTCPeerConnection(RTC_CFG);
+    const ch = pc.createDataChannel('game', { ordered: true });
+    const peer = { pc, ch, open: false, pend: [], remoteSet: false };
+    peers[pid] = peer;
+    ch.onopen = () => { peer.open = true; };
+    ch.onclose = () => { peer.open = false; };
+    ch.onmessage = (e) => onPeerMessage(pid, e.data);
+    pc.onicecandidate = (e) => { if (e.candidate) sigRef(pid).child('hostCand').push(e.candidate.toJSON()); };
+    sigRef(pid).child('answer').on('value', async (s) => {
+      const a = s.val();
+      if (a && !peer.remoteSet) { peer.remoteSet = true; await pc.setRemoteDescription(new RTCSessionDescription(a)); flushCand(peer); }
+    });
+    sigRef(pid).child('cliCand').on('child_added', (s) => addCand(peer, s.val()));
+    pc.createOffer().then(o => pc.setLocalDescription(o)).then(() => {
+      sigRef(pid).child('offer').set({ type: pc.localDescription.type, sdp: pc.localDescription.sdp });
+    }).catch(() => {});
+  }
+
+  function clientConnect() {
+    const pc = new RTCPeerConnection(RTC_CFG);
+    const peer = { pc, ch: null, open: false, pend: [], remoteSet: false };
+    hostPeer = peer;
+    pc.ondatachannel = (e) => {
+      const ch = e.channel; peer.ch = ch;
+      ch.onopen = () => { peer.open = true; };
+      ch.onclose = () => { peer.open = false; };
+      ch.onmessage = (ev) => onHostMessage(ev.data);
+    };
+    pc.onicecandidate = (e) => { if (e.candidate) sigRef(me).child('cliCand').push(e.candidate.toJSON()); };
+    sigRef(me).child('offer').on('value', async (s) => {
+      const o = s.val();
+      if (o && !peer.remoteSet) {
+        peer.remoteSet = true;
+        await pc.setRemoteDescription(new RTCSessionDescription(o));
+        const a = await pc.createAnswer(); await pc.setLocalDescription(a);
+        sigRef(me).child('answer').set({ type: a.type, sdp: a.sdp });
+        flushCand(peer);
+      }
+    });
+    sigRef(me).child('hostCand').on('child_added', (s) => addCand(peer, s.val()));
+  }
+
+  function addCand(peer, c) {
+    if (!c) return;
+    if (peer.remoteSet) peer.pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
+    else peer.pend.push(c);
+  }
+  function flushCand(peer) { peer.pend.forEach(c => peer.pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {})); peer.pend = []; }
+
+  function onPeerMessage(pid, data) {  // ホストがクライアントから受信
+    let m; try { m = JSON.parse(data); } catch (e) { return; }
+    if (m.t === 'in') { inputsMap[pid] = m.d; if (inputsCb) inputsCb(inputsMap); }
+  }
+  function onHostMessage(data) {        // クライアントがホストから受信
+    let m; try { m = JSON.parse(data); } catch (e) { return; }
+    if (m.t === 'sn' && snapCb) snapCb(m.d);
+  }
+
+  function teardownRTC() {
+    for (const pid in peers) { try { peers[pid].ch && peers[pid].ch.close(); peers[pid].pc.close(); } catch (e) {} }
+    peers = {};
+    if (hostPeer) { try { hostPeer.ch && hostPeer.ch.close(); hostPeer.pc.close(); } catch (e) {} hostPeer = null; }
+    inputsMap = {};
+  }
+
+  /* ----- 試合中の同期用 API（game.js から呼ぶ：P2P優先・RTDBフォールバック） ----- */
+  function writeInput(obj) {            // クライアント → ホスト
+    if (hostPeer && hostPeer.open && hostPeer.ch.readyState === 'open') {
+      try { hostPeer.ch.send(JSON.stringify({ t: 'in', d: obj })); return; } catch (e) {}
+    }
+    if (roomRef) roomRef.child('inputs/' + me).set(obj);   // フォールバック
+  }
+  function onInputs(cb) {               // ホスト：全クライアントの入力を集約
+    inputsCb = cb;
+    inputsRef = roomRef.child('inputs');
+    inputsRef.on('value', (s) => {       // RTDBフォールバック分を取り込む
+      const m = s.val() || {};
+      for (const pid in m) { if (!peers[pid] || !peers[pid].open) inputsMap[pid] = m[pid]; }
+      cb(inputsMap);
+    });
+  }
+  function writeSnapshot(obj) {          // ホスト → 全クライアント
+    const msg = JSON.stringify({ t: 'sn', d: obj });
+    let needRTDB = false;
+    const pids = Object.keys(peers);
+    if (pids.length === 0) needRTDB = true;
+    for (const pid of pids) {
+      const p = peers[pid];
+      if (p.open && p.ch.readyState === 'open') { try { p.ch.send(msg); } catch (e) { needRTDB = true; } }
+      else needRTDB = true;
+    }
+    if (needRTDB && roomRef) roomRef.child('snapshot').set(obj);   // 未接続クライアント向けフォールバック
+  }
+  function onSnapshot(cb) {              // クライアント：スナップショット受信
+    snapCb = cb;
+    snapshotRef = roomRef.child('snapshot');
+    snapshotRef.on('value', (s) => { const v = s.val(); if (v && (!hostPeer || !hostPeer.open)) cb(v); });  // 未接続時のみRTDB
+  }
+  function setState(s)       { if (roomRef) roomRef.child('state').set(s); }
+  function clearMatchData()  { if (roomRef) { roomRef.child('inputs').remove(); roomRef.child('snapshot').remove(); } }
+
+  const BTN  = 'display:block;width:100%;padding:14px;margin:10px 0 6px;font-size:22px;border:none;border-radius:10px;background:#2e8b57;color:#fff;cursor:pointer;';
+  const BTN2 = 'display:inline-block;padding:10px 20px;margin-top:12px;font-size:16px;border:none;border-radius:8px;background:#3a4a6a;color:#fff;cursor:pointer;';
+  const INP  = 'display:block;width:100%;box-sizing:border-box;padding:14px;margin:8px 0;font-size:28px;text-align:center;letter-spacing:8px;border-radius:10px;border:2px solid #4a5a7a;background:#1d2840;color:#fff;';
+  const SEL  = 'padding:8px 12px;font-size:15px;border:none;border-radius:8px;background:#26324d;color:#fff;cursor:pointer;';
+  const INP2 = 'display:block;width:100%;box-sizing:border-box;padding:12px;margin:6px 0;font-size:18px;border-radius:10px;border:2px solid #4a5a7a;background:#1d2840;color:#fff;';
+  const TXT  = 'display:block;width:100%;box-sizing:border-box;padding:12px;margin:6px 0;font-size:16px;height:84px;resize:none;border-radius:10px;border:2px solid #4a5a7a;background:#1d2840;color:#fff;font-family:inherit;';
+
+  return {
+    available, openRoomUI, openRequestUI,
+    writeInput, onInputs, writeSnapshot, onSnapshot, setState, clearMatchData, leave, returnToLobby,
+    get myId() { return me; },
+    get isHost() { return isHost; },
+  };
+})();
+
+</script>
+<script>
+/* =========================================================================
+ *  スンマ戦 (Sunma-sen)  —  Canvas 2D 実装  (設計書 v1.4)
+ *  スプライト不要・棒人間ボーンアニメーション方式
+ * ========================================================================= */
+'use strict';
+
+/* ======================= 0. 基本定数 ======================= */
+const W = 1280, H = 720;               // 内部解像度（横画面基準・設計書 15.1）
+const FOOT = 25;                       // 腰から足先までの長さ（脚=太もも13+すね12）
+const GRAVITY = 0.62;
+const JUMP_V = -13.5;
+const FRICTION_G = 0.80;
+const FRICTION_A = 0.94;
+
+// ---- シールド（Bボタン） ----
+const SHIELD_MAX = 100;          // シールド耐久
+const SHIELD_REGEN = 0.30;       // 非使用時の回復/フレーム
+const SHIELD_DRAIN = 0.12;       // 展開中の自然消耗/フレーム
+const SHIELD_HIT_FACTOR = 2.2;   // 被弾時に削れる量＝ダメージ×係数
+const GUARD_BREAK_STUN = 120;    // ガード割れ＝2秒(120フレーム)行動不能
+
+// ---- 時間停止（timeキャラ） ----
+const TIME_STOP = 180;           // 停止される側＝3秒(180フレーム)完全停止
+const TIME_CD = 1800;            // クールタイム30秒
+
+// ---- スロー（slowキャラ） ----
+const SLOW_DUR = 300;            // 鈍化5秒(300フレーム)
+const SLOW_FACTOR = 0.4;         // 移動・ジャンプ0.4倍
+const SLOW_CD = 1800;            // クールタイム30秒
+
+// ---- お絵かき（Q2キャラ） ----
+const DRAW_BUDGET = 1500;        // 1セッションで描ける線の総長（px）。使い切るとクールタイム
+const DRAW_CD = 720;             // クールタイム12秒(720フレーム)
+
+// ---- スーパーパワー（SUPER POWERキャラ） ----
+const SUPER_DUR = 900;           // 効果15秒(900フレーム)：相手へのノックバック1.7倍
+const SUPER_KB = 1.7;            // ノックバック距離倍率
+const SUPER_CD = 2400;           // クールタイム40秒(2400フレーム)
+
+// ---- リバース（REVERSEキャラ） ----
+const REVERSE_DUR = 600;         // リバースモード10秒(600フレーム)
+const REVERSE_HIT = 300;         // 攻撃を受けた相手の操作反転5秒(300フレーム)
+const REVERSE_CD = 1200;         // クールタイム20秒(1200フレーム)
+
+// ---- ジャンプ封じ（noJumperキャラ） ----
+const NOJUMP_DUR = 480;          // 自分以外がジャンプ不可になる時間8秒(480フレーム)
+const NOJUMP_CD = 1800;          // クールタイム30秒(1800フレーム)
+
+// ---- 加速（YOSENキャラ） ----
+const DASH_DUR = 480;            // 自分の速度1.5倍が続く8秒(480フレーム)
+const DASH_MUL = 1.5;            // 速度倍率
+const DASH_CD = 960;             // クールタイム16秒(960フレーム)
+
+// ---- シールド粉砕（HPOPキャラ） ----
+const SHATTER_DUR = 1800;        // 一撃でガードを割る効果30秒(1800フレーム)
+const SHATTER_CD = 2400;         // クールタイム40秒(2400フレーム)
+
+// ---- 無敵（YUTONキャラ） ----
+const INVINC_DUR = 600;          // 無敵10秒(600フレーム)
+const INVINC_CD = 2700;          // クールタイム45秒(2700フレーム)
+
+// ---- スマッシュ攻撃（全キャラ共通：Y長押し→離して発動） ----
+const SMASH_HOLD = 16;           // この長さ(フレーム)以上Yを押すとスマッシュ
+const SMASH_DMG_MUL = 1.2;       // スマッシュのダメージ倍率
+const SMASH_KB_MUL = 2.5;        // スマッシュのノックバック倍率
+
+// ---- ボム（全キャラ共通の武器） ----
+const BOMB_CD = 240;             // 設置クールタイム4秒(240フレーム)
+const BOMB_FUSE = 120;           // 設置から爆発まで2秒(120フレーム)
+const BOMB_R = 130;              // 爆発の半径
+const BOMB_MOVE = { name:'爆発', dmg:14, kb:9, kbg:0.13, reach:0, h:0 };   // 爆発のダメージ/ノックバック
+
+// ---- バナナ（BANANAキャラ） ----
+const BANANA_CD = 180;           // 設置のクールタイム3秒(180フレーム)
+const BANANA_LIFE = 1800;        // 設置したバナナが残る時間30秒(1800フレーム)
+const SLIP_DUR = 55;             // 滑って操作不能になる時間(55フレーム)
+
+// ---- 分身（MIRRORキャラ） ----
+const MIRROR_MAX = 2;            // 同時に出せる分身の最大数＝チャージ数
+const MIRROR_HITS = 5;           // 分身は攻撃を5発食らうと消滅
+const MIRROR_CD = 2700;          // 2体出し切ってから次に出せるまで45秒(2700フレーム)
+
+// ---- ステージ（設計書 10）：浮遊メイン台 + 中央台。複数から選択 ----
+const STAGES = [
+  { name:'スカイタワー',
+    main:{ x1:200, x2:1080, y:540 }, center:{ x1:520, x2:760, y:360 },
+    blastL:-180, blastR:1460, blastTop:-360, blastBottom:1000,
+    theme:{ sky:['#2b3a67','#1f2a4a','#0c1226'], bg:'rgba(20,30,60,0.6)',
+            mainFill:'#3a4a6a', mainTop:'#52628a', centerFill:'#46567e', centerTop:'#6678a8' } },
+  { name:'ひろがる草原',
+    main:{ x1:120, x2:1160, y:560 }, center:{ x1:560, x2:720, y:285 },
+    blastL:-180, blastR:1460, blastTop:-360, blastBottom:1000,
+    theme:{ sky:['#7ec8e3','#9fd6e8','#cfeecb'], bg:'rgba(70,130,80,0.5)',
+            mainFill:'#5f8743', mainTop:'#8cba5e', centerFill:'#557a3d', centerTop:'#7faa55' } },
+  { name:'マグマの闘技場',
+    main:{ x1:360, x2:920, y:520 }, center:{ x1:540, x2:740, y:345 },
+    blastL:-180, blastR:1460, blastTop:-360, blastBottom:1000,
+    theme:{ sky:['#3a1212','#5a1606','#160404'], bg:'rgba(90,25,12,0.6)',
+            mainFill:'#5a2a1a', mainTop:'#b34a22', centerFill:'#4a2015', centerTop:'#cc551f' } },
+];
+const STAGE = {};        // アクティブステージ（applyStageで内容を差し替え）
+const PLATFORMS = [];    // アクティブな足場（applyStageで再構築。物理はこの参照を使う）
+function applyStage(i) {
+  const idx = ((i | 0) % STAGES.length + STAGES.length) % STAGES.length;
+  const s = STAGES[idx];
+  STAGE.id = idx; STAGE.name = s.name;
+  STAGE.main = s.main; STAGE.center = s.center;
+  STAGE.blastL = s.blastL; STAGE.blastR = s.blastR; STAGE.blastTop = s.blastTop; STAGE.blastBottom = s.blastBottom;
+  STAGE.theme = s.theme;
+  PLATFORMS.length = 0; PLATFORMS.push(STAGE.main, STAGE.center);
+}
+applyStage(0);           // 既定ステージ
+// 4人がなるべく離れて出現（最も狭いステージの台 x:360〜920 内に収め、場外落下を防ぐ）
+const SPAWN = [ {x: 430, y: -60}, {x: 850, y: -60}, {x: 580, y: -150}, {x: 700, y: -240} ];
+
+/* ======================= 1. キャラクター定義（設計書 5） ======================= */
+const CHARS = {
+  chara_hpop:      { id:'chara_hpop',      name:'hpop',      trait:'攻撃',     speed:5, jumps:3, atk:1.2,  def:1.2, weight:100, desc:'攻撃型：与ダメ大／被ダメも大（脆い）。ガード不可／発動で30秒間、攻撃が相手のシールドを一撃で割る（CT40秒）' },
+  chara_yuton:     { id:'chara_yuton',     name:'yuton',     trait:'防御',     speed:5, jumps:3, atk:0.85, def:0.8, weight:100, desc:'防御型：硬いが攻撃は控えめ／発動で10秒間無敵（CT45秒）' },
+  chara_gasugaeso: { id:'chara_gasugaeso', name:'GASUGAESO', trait:'バランス', speed:5, jumps:3, atk:1.0,  def:1.0, weight:100, shieldMul:1.5, guardScale:1.3, desc:'バランス型：標準性能＋シールド耐久1.5倍・ガード1.3倍' },
+  chara_himan:     { id:'chara_himan',     name:'HIMAN',     trait:'ジャンプ', speed:5, jumps:5, atk:1.0,  def:1.2, weight:100, desc:'ジャンプ型：5段ジャンプ／被ダメ1.2倍／6番目で大大剣（大剣の2倍リーチ・判定大）を装備' },
+  chara_yosen:     { id:'chara_yosen',     name:'YOSEN',     trait:'速度',     speed:6, jumps:3, atk:1.0,  def:1.0, weight:100, desc:'速度型：移動が速い（SP中はさらに倍速）／発動で8秒間さらに速度1.5倍（CT16秒）' },
+  chara_math:      { id:'chara_math',      name:'math',      trait:'算数',     speed:5, jumps:2, atk:1.0,  def:1.0, weight:100, desc:'算数型：2段ジャンプ／算数で相手を足止め' },
+  chara_time:      { id:'chara_time',      name:'time',      trait:'時間',     speed:4.5, jumps:3, atk:1.0, def:1.0, weight:100, desc:'時間型：速度0.9倍／全員の時間を3秒停止（CT30秒）' },
+  chara_slow:      { id:'chara_slow',      name:'slow',      trait:'鈍化',     speed:5, jumps:3, atk:1.0,  def:1.2, weight:100, desc:'鈍化型：被ダメ1.2倍／全員を4秒間0.4倍速（CT30秒）' },
+  chara_q2:        { id:'chara_q2',        name:'Q2',        trait:'お絵かき', speed:5, jumps:3, atk:1.0,  def:1.0, weight:100, desc:'お絵かき型：白線を描き落として転がし相手をノックバック（描画中は無防備）' },
+  chara_superpower:{ id:'chara_superpower', name:'SUPER POWER', trait:'怪力', speed:5, jumps:2, atk:1.0, def:1.0, weight:100, desc:'怪力型：2段ジャンプ／発動で15秒間ノックバック1.7倍（CT40秒）' },
+  chara_supergard: { id:'chara_supergard', name:'SUPER GARD', trait:'要塞', speed:3.5, jumps:3, atk:1.0, def:0.8, weight:100, shieldMul:2, guardScale:2, desc:'要塞型：速度0.7倍／被ダメ0.8倍／シールド耐久2倍でガードも大きい' },
+  chara_reverse:   { id:'chara_reverse',   name:'REVERSE',    trait:'反転', speed:5, jumps:3, atk:0.9, def:1.0, weight:100, desc:'反転型：与ダメ0.9倍／発動で10秒間、攻撃を当てた相手の移動操作を5秒間逆にする（CT20秒）' },
+  chara_hell:      { id:'chara_hell',      name:'hell',       trait:'地獄', speed:7.5, jumps:3, atk:1.5, def:1.0, weight:100, startDmg:100, kbDealtMul:1.5, desc:'地獄型：常にダメージ100%スタート／速度1.5倍・与ダメ1.5倍・相手を吹っ飛ばす距離1.5倍' },
+  chara_mirror:    { id:'chara_mirror',    name:'MIRROR',     trait:'分身', speed:5, jumps:3, atk:1.0, def:1.0, weight:100, desc:'分身型：発動で攻撃する分身を最大2体召喚（5発で消滅・自分には当たらない）。2体出し切るとCT45秒' },
+  chara_nojumper:  { id:'chara_nojumper',  name:'noJumper',   trait:'封印', speed:5, jumps:4, atk:1.0, def:1.2, weight:100, desc:'封印型：4段ジャンプ／被ダメ1.2倍／発動で8秒間、自分以外のジャンプを封じる（CT30秒）' },
+  chara_hande:     { id:'chara_hande',     name:'hande',      trait:'弱小', speed:4, jumps:2, atk:0.8, def:1.2, weight:80, desc:'ハンデ型：全性能が約0.8倍で弱い／2段ジャンプ。それでも優勝すると…？' },
+  chara_banana:    { id:'chara_banana',    name:'BANANA',     trait:'バナナ', speed:5, jumps:3, atk:1.0, def:1.0, weight:100, desc:'バナナ型：一本の棒の体／移動で傾く。地面にバナナを設置、踏んだ相手を滑らせる（CT3秒）' },
+};
+const CHAR_ORDER = ['chara_hpop','chara_yuton','chara_gasugaeso','chara_himan','chara_yosen','chara_math','chara_time','chara_slow','chara_q2','chara_superpower','chara_supergard','chara_reverse','chara_hell','chara_mirror','chara_nojumper','chara_hande','chara_banana'];
+
+/* ======================= 1.1 カラーパレット（設計書 17.3） ======================= */
+const COLORS = [
+  { name:'レッド',   std:'#E63946', dim:'#F4A8AC' },
+  { name:'ブルー',   std:'#1D7FD4', dim:'#8FC3EE' },
+  { name:'グリーン', std:'#2DC653', dim:'#96E3AE' },
+  { name:'イエロー', std:'#F4C430', dim:'#FAE296' },
+  { name:'オレンジ', std:'#F4821F', dim:'#FAC08F' },
+  { name:'パープル', std:'#7B2FBE', dim:'#C19FDF' },
+  { name:'ピンク',   std:'#E91E8C', dim:'#F48FCA' },
+  { name:'ホワイト', std:'#F0F0F0', dim:'#C8C8C8' },
+];
+
+/* ======================= 2. 武器・攻撃データ（設計書 6） ======================= */
+// dir: none / side / up / down / air
+// kb=基本ノックバック, kbg=ノックバック成長, reach=横リーチ, h=縦判定, fwd=前進量,
+// up=打ち上げ, spike=メテオ, proj=飛び道具, parts=多段(合計dmgは均等割り)
+const WEAPONS = {
+  bare: { label:'素手', icon:'✊', attacks:{
+    // none はコンボ専用処理（3/3/6）
+    side:{ name:'横スマッシュ', dmg:10, kb:6,  kbg:0.10, reach:62, h:60, fwd:6 },
+    up:  { name:'上スマッシュ', dmg:9,  kb:5,  kbg:0.09, reach:50, h:90, up:9 },
+    down:{ name:'下スマッシュ', dmg:8,  kb:4,  kbg:0.08, reach:58, h:40 },
+    air: { name:'空中攻撃',     dmg:7,  kb:4,  kbg:0.08, reach:55, h:70 },
+  }},
+  gun: { label:'銃', icon:'🔫', attacks:{
+    none:{ name:'射撃',     dmg:7, kb:3, kbg:0.05, proj:'straight' },
+    side:{ name:'乱射',     dmg:4, kb:2, kbg:0.04, proj:'burst', parts:3 },
+    up:  { name:'上射',     dmg:6, kb:3, kbg:0.05, proj:'up' },
+    down:{ name:'下射',     dmg:6, kb:3, kbg:0.05, proj:'down', airOnly:true },
+    air: { name:'空中射撃', dmg:7, kb:3, kbg:0.05, proj:'straight' },
+  }},
+  tachi: { label:'太刀', icon:'⚔️', attacks:{
+    none:{ name:'斬り',   dmg:9,  kb:5, kbg:0.09, reach:70, h:70 },
+    side:{ name:'居合い', dmg:14, kb:7, kbg:0.11, reach:90, h:60, fwd:34 },
+    up:  { name:'袈裟斬り', dmg:11, kb:6, kbg:0.10, reach:60, h:100, up:8 },
+    down:{ name:'地斬り', dmg:10, kb:5, kbg:0.09, reach:80, h:40, groundOnly:true },
+    air: { name:'空中斬り', dmg:12, kb:6, kbg:0.10, reach:75, h:90 },
+  }},
+  daiken: { label:'大剣', icon:'🗡️', attacks:{
+    none:{ name:'重撃',     dmg:16, kb:10, kbg:0.14, reach:80, h:90, startup:10 },
+    side:{ name:'薙ぎ払い', dmg:8,  kb:7,  kbg:0.11, reach:95, h:70, parts:2 },
+    up:  { name:'振り上げ', dmg:14, kb:8,  kbg:0.12, reach:65, h:120, up:11 },
+    down:{ name:'地割れ',   dmg:12, kb:7,  kbg:0.10, reach:110, h:40 },
+    air: { name:'空中叩きつけ', dmg:15, kb:9, kbg:0.12, reach:60, h:110, spike:14 },
+  }},
+  // ボム：通常の斬撃ではなく、Yで足元に設置→2秒後に爆発（startAttackで特別処理）
+  bomb: { label:'ボム', icon:'💣', attacks:{} },
+  glove: { label:'パンチグローブ', icon:'🥊', attacks:{
+    none:{ name:'ストレート', dmg:13, kb:7, kbg:0.11, reach:60, h:55 },
+    side:{ name:'ラッシュ',   dmg:3,  kb:2, kbg:0.05, reach:58, h:55, parts:5 },
+    up:  { name:'アッパー',   dmg:12, kb:7, kbg:0.11, reach:50, h:100, up:11 },
+    down:{ name:'スウィング', dmg:11, kb:6, kbg:0.10, reach:64, h:50 },
+    air: { name:'空中フック', dmg:11, kb:6, kbg:0.10, reach:62, h:75 },
+  }},
+  // 大大剣（HIMAN専用）：大剣のリーチ2倍・縦判定も拡大
+  daidaiken: { label:'大大剣', icon:'🗡️', attacks:{
+    none:{ name:'特大重撃',     dmg:16, kb:10, kbg:0.14, reach:160, h:135, startup:10 },
+    side:{ name:'大薙ぎ払い',   dmg:8,  kb:7,  kbg:0.11, reach:190, h:105, parts:2 },
+    up:  { name:'大振り上げ',   dmg:14, kb:8,  kbg:0.12, reach:130, h:180, up:11 },
+    down:{ name:'大地割れ',     dmg:12, kb:7,  kbg:0.10, reach:220, h:60 },
+    air: { name:'大空中叩きつけ', dmg:15, kb:9, kbg:0.12, reach:120, h:165, spike:14 },
+  }},
+};
+const WEAPON_ORDER = ['gun','tachi','daiken','bomb','glove'];
+
+/* ======================= 3. サウンド（Web Audio 合成 SE：設計書 15.2） ======================= */
+const Sound = (() => {
+  let ctx = null, master = null;
+  let enabled = true, volume = 0.5;     // SE有効フラグ / 音量(0〜1)
+  try {                                  // 前回の設定を復元
+    const v = localStorage.getItem('sunma_se');
+    if (v != null) { const o = JSON.parse(v); if (typeof o.on === 'boolean') enabled = o.on; if (typeof o.vol === 'number') volume = Math.max(0, Math.min(1, o.vol)); }
+  } catch (e) {}
+  function applyGain() { if (master) master.gain.value = enabled ? 0.7 * volume : 0; }   // volume=0.5で従来の0.35
+  function save() { try { localStorage.setItem('sunma_se', JSON.stringify({ on: enabled, vol: volume })); } catch (e) {} }
+  function ensure() {
+    if (ctx) return;
+    try {
+      ctx = new (window.AudioContext || window.webkitAudioContext)();
+      master = ctx.createGain(); applyGain(); master.connect(ctx.destination);
+    } catch (e) { ctx = null; }
+  }
+  function tone(freq, dur, type, vol, slideTo) {
+    if (!ctx) return;
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.type = type || 'square'; o.frequency.value = freq;
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(Math.max(20, slideTo), ctx.currentTime + dur);
+    g.gain.value = vol == null ? 0.5 : vol;
+    g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + dur);
+    o.connect(g); g.connect(master); o.start(); o.stop(ctx.currentTime + dur);
+  }
+  function noise(dur, vol) {
+    if (!ctx) return;
+    const n = Math.floor(ctx.sampleRate * dur);
+    const buf = ctx.createBuffer(1, n, ctx.sampleRate), d = buf.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+    const s = ctx.createBufferSource(), g = ctx.createGain();
+    s.buffer = buf; g.gain.value = vol == null ? 0.4 : vol;
+    s.connect(g); g.connect(master); s.start();
+  }
+  // SEキー → 合成パラメータ（設計書 15.2 のSE一覧に対応）
+  const MAP = {
+    se_punch1:   (d=0)=>tone(440,0.07,'square',0.4,360+d),
+    se_punch2:   (d=0)=>tone(330,0.09,'square',0.5,260+d),
+    se_punch3_kb:(d=0)=>{tone(180,0.18,'sawtooth',0.6,90); noise(0.12,0.5);},
+    se_weapon_hit:()=>{tone(900,0.08,'square',0.4,600); noise(0.06,0.3);},
+    se_gun_shot: ()=>{tone(220,0.08,'square',0.4,80); noise(0.05,0.4);},
+    se_gun_hit:  ()=>tone(700,0.06,'triangle',0.3,500),
+    se_sword_swing:()=>tone(600,0.12,'sine',0.25,1200),
+    se_lance_thrust:()=>{tone(500,0.08,'sawtooth',0.3,300);},
+    se_glove_hit:()=>{tone(140,0.16,'sawtooth',0.6,70); noise(0.1,0.5);},
+    se_jump:  ()=>tone(520,0.12,'sine',0.3,820),
+    se_jump2: ()=>tone(640,0.10,'sine',0.3,940),
+    se_jump3: ()=>tone(760,0.08,'sine',0.3,1040),
+    se_land:  ()=>noise(0.06,0.25),
+    se_burst: ()=>{tone(120,0.4,'sawtooth',0.6,40); noise(0.35,0.6);},
+    se_stock_lost:()=>tone(300,0.25,'square',0.5,120),
+    se_countdown:()=>tone(880,0.15,'sine',0.5),
+    se_gong: ()=>{tone(160,0.8,'sine',0.6,80); tone(240,0.8,'triangle',0.3,120);},
+    se_item_open:()=>tone(1000,0.12,'triangle',0.35,1400),
+    se_item_equip:()=>tone(700,0.08,'square',0.35,900),
+    se_item_close:()=>tone(500,0.06,'triangle',0.25,300),
+    se_special_activate:()=>{tone(300,0.4,'sawtooth',0.4,1200);},
+    se_special_ready:()=>tone(1320,0.18,'sine',0.4),
+    se_win:  ()=>{tone(523,0.15,'triangle',0.5); setTimeout(()=>tone(659,0.15,'triangle',0.5),150); setTimeout(()=>tone(784,0.3,'triangle',0.5),300);},
+    se_ui_select:()=>tone(660,0.05,'square',0.3),
+    se_ui_decide:()=>tone(880,0.1,'triangle',0.4,1100),
+    se_timestop:()=>{ tone(700,0.5,'sine',0.5,90); tone(350,0.6,'triangle',0.3,60); noise(0.2,0.2); },
+    se_timeresume:()=>tone(200,0.25,'sine',0.4,700),
+    se_slow:()=>{ tone(500,0.45,'sawtooth',0.4,140); tone(250,0.5,'sine',0.3,90); },
+  };
+  let _rec = null;   // ネット対戦：ホストで鳴ったSEを記録してクライアントへ配信
+  return {
+    unlock(){ ensure(); if (ctx && ctx.state === 'suspended') ctx.resume(); },
+    play(key, detune=0){ if (_rec) _rec.push(detune ? [key, detune] : [key]); if (!enabled) return; ensure(); const f = MAP[key]; if (f) try{ f(detune); }catch(e){} },
+    // クライアント側：受信したSEを鳴らす（記録はしない）
+    playRemote(key, detune){ if (!enabled) return; ensure(); const f = MAP[key]; if (f) try{ f(detune||0); }catch(e){} },
+    // SE設定（タイトル画面のUIから操作）
+    isEnabled(){ return enabled; },
+    getVolume(){ return volume; },
+    toggle(){ enabled = !enabled; applyGain(); save(); if (enabled) { this.unlock(); this.play('se_ui_decide'); } return enabled; },
+    setVolume(v){ volume = Math.max(0, Math.min(1, v)); applyGain(); save(); },
+    beginCapture(){ _rec = []; },
+    endCapture(){ const r = _rec || []; _rec = null; return r; },
+    playHitWithDamage(dmgPct){ this.play('se_punch3_kb', Math.min(dmgPct*2,400)); },
+  };
+})();
+
+/* ======================= 4. 入力（キーボード + 仮想コントローラ：設計書 4） ======================= */
+const Input = {
+  held: { left:false, right:false, up:false, down:false, X:false, Y:false, A:false, B:false, SP:false },
+  prev: {},
+  edge: {},                       // このフレームに押された
+  // 仮想スティック状態
+  stick: { active:false, id:null, ox:0, oy:0, dx:0, dy:0 },
+  // 仮想ボタンのヒット領域（描画時に更新）
+  btnRects: {},
+  pointerBtn: {},                 // pointerId -> button name
+
+  kb: { left:false, right:false, up:false, down:false },   // キーボード方向（スティックと分離）
+
+  init() {
+    for (const k in this.held) this.prev[k] = false;
+    window.addEventListener('keydown', e => this.key(e, true));
+    window.addEventListener('keyup',   e => this.key(e, false));
+    // フォーカスを失ったら全入力を解放（押しっぱなし防止）
+    window.addEventListener('blur', () => this.releaseAll());
+  },
+  releaseAll() {
+    for (const k in this.held) this.held[k] = false;
+    this.kb.left = this.kb.right = this.kb.up = this.kb.down = false;
+    this.stick.active = false; this.stick.id = null; this.stick.dx = 0; this.stick.dy = 0;
+  },
+  key(e, down) {
+    let k = null;
+    switch (e.code) {
+      case 'ArrowLeft': case 'KeyA': k='left'; break;
+      case 'ArrowRight': case 'KeyD': k='right'; break;
+      case 'ArrowUp': case 'KeyW': k='up'; break;
+      case 'ArrowDown': case 'KeyS': k='down'; break;
+      case 'KeyK': k='X'; break;      // ジャンプ
+      case 'KeyJ': k='Y'; break;      // 攻撃
+      case 'KeyL': k='A'; break;      // アイテム
+      case 'Semicolon': case 'KeyP': k='B'; break;   // 閉じる
+      case 'Space': case 'ShiftLeft': k='SP'; break;
+      case 'Enter': k='enter'; break;
+    }
+    if (k === 'left' || k === 'right' || k === 'up' || k === 'down') { this.kb[k] = down; e.preventDefault(); }
+    else if (k && this.held.hasOwnProperty(k)) { this.held[k] = down; e.preventDefault(); }
+    if (k === 'enter' && down) this._enter = true;
+  },
+  // 仮想コントローラ pointer（screen座標→canvas座標は Game 側で変換して渡す）
+  onPointerDown(id, x, y) {
+    // 左半分はスティック、右半分はボタン
+    if (x < W * 0.42 && y > H * 0.45) {
+      this.stick.active = true; this.stick.id = id; this.stick.ox = x; this.stick.oy = y; this.stick.dx = 0; this.stick.dy = 0;
+      return;
+    }
+    for (const name in this.btnRects) {
+      const r = this.btnRects[name];
+      if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) {
+        this.held[name] = true; this.pointerBtn[id] = name; return;
+      }
+    }
+  },
+  onPointerMove(id, x, y) {
+    if (this.stick.active && this.stick.id === id) {
+      this.stick.dx = x - this.stick.ox; this.stick.dy = y - this.stick.oy;
+    }
+  },
+  onPointerUp(id) {
+    if (this.stick.id === id) { this.stick.active = false; this.stick.id = null; this.stick.dx = 0; this.stick.dy = 0; }
+    const b = this.pointerBtn[id];
+    if (b) { this.held[b] = false; delete this.pointerBtn[id]; }
+  },
+  // スティックを held の方向へ反映してから edge を計算
+  axisX: 0,                 // 左スティックの横アナログ量（-1..1）：倒し具合で移動の強弱
+  update() {
+    // スティック方向を毎フレーム算出（active でなければ全方向OFF＝離せばニュートラルに戻る）
+    let sL = false, sR = false, sU = false, sD = false;
+    this.axisX = 0;
+    if (this.stick.active) {
+      const dz = 18, ax = this.stick.dx, ay = this.stick.dy;
+      if (Math.hypot(ax, ay) > dz) {
+        if (Math.abs(ax) > Math.abs(ay) * 0.7) { if (ax < 0) sL = true; else sR = true; }
+        if (ay < -dz && Math.abs(ay) > Math.abs(ax) * 0.9) sU = true;
+        if (ay >  dz && Math.abs(ay) > Math.abs(ax) * 0.9) sD = true;
+      }
+      // 横アナログ量：デッドゾーン18px〜フル90pxを 0〜1 に正規化
+      const dead = 18, maxR = 90, mag = Math.abs(ax);
+      if (mag > dead) this.axisX = Math.sign(ax) * Math.min(1, (mag - dead) / (maxR - dead));
+    }
+    // キーボード or スティックのどちらかが入っていればON、両方ニュートラルなら必ずOFF
+    this.held.left  = this.kb.left  || sL;
+    this.held.right = this.kb.right || sR;
+    this.held.up    = this.kb.up    || sU;
+    this.held.down  = this.kb.down  || sD;
+    for (const k in this.held) this.edge[k] = this.held[k] && !this.prev[k];
+    for (const k in this.held) this.prev[k] = this.held[k];
+  },
+  // 左スティックの方向判定（設計書 4）
+  dir() {
+    if (this.held.up) return 'up';
+    if (this.held.down) return 'down';
+    if (this.held.left || this.held.right) return 'side';
+    return 'none';
+  },
+  dirX() { return (this.held.right ? 1 : 0) - (this.held.left ? 1 : 0); },
+  // 移動用のアナログ横入力（キーボードは±1、スティックは倒し具合）
+  moveX() {
+    if (this.kb.left && !this.kb.right) return -1;
+    if (this.kb.right && !this.kb.left) return 1;
+    if (this.stick.active) return this.axisX;
+    return 0;
+  },
+};
+
+/* ======================= 5. 補間ユーティリティ ======================= */
+function lerp(a, b, t) { return a + (b - a) * t; }
+function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+function rectsOverlap(a, b) { return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y; }
+function ri(lo, hi) { return Math.floor(Math.random() * (hi - lo + 1)) + lo; }
+function strokeLen(pts) { let L = 0; for (let i = 1; i < pts.length; i++) L += Math.hypot(pts[i].x - pts[i-1].x, pts[i].y - pts[i-1].y); return L; }
+function shuffle(arr) { for (let i = arr.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); const t = arr[i]; arr[i] = arr[j]; arr[j] = t; } return arr; }
+
+// 算数の問題（mathキャラ）：+ - × ÷、数字は15以下で簡単に
+function genMathProblem() {
+  const op = ['+', '-', '×', '÷'][Math.floor(Math.random() * 4)];
+  let a, b, ans;
+  if (op === '+') { a = ri(1, 15); b = ri(1, 15); ans = a + b; }
+  else if (op === '-') { a = ri(1, 15); b = ri(1, a); ans = a - b; }
+  else if (op === '×') { a = ri(2, 9); b = ri(2, 9); ans = a * b; }
+  else { do { b = ri(2, 5); const c = ri(2, 5); a = b * c; ans = c; } while (a > 15); }
+  const text = a + ' ' + op + ' ' + b;
+  const set = new Set([ans]);
+  while (set.size < 4) { const d = ans + ri(-4, 4); if (d >= 0 && d !== ans) set.add(d); }
+  return { text, answer: ans, choices: shuffle([...set]) };
+}
+
+/* ======================= 6. Fighter（キャラ本体） ======================= */
+let nextEntityId = 1;
+class Fighter {
+  constructor(charId, colorIdx, opts = {}) {
+    this.eid = nextEntityId++;
+    this.def = CHARS[charId];
+    this.colorIdx = colorIdx;
+    this.dimColor = !!opts.dim;          // 色被り（薄版）
+    this.isHuman = !!opts.human;
+    this.isBot = !!opts.bot;
+    this.botMode = opts.botMode || 'cpu';  // 'static' | 'cpu'
+    this.label = opts.label || this.def.name;
+
+    this.x = 640; this.y = 540;          // y=足先
+    this.vx = 0; this.vy = 0;
+    this.facing = 1;                     // 1=右, -1=左（設計書 18）
+    this.curFlipX = 1;
+    this.grounded = false;
+    this.jumpsLeft = this.def.jumps;
+
+    this.damage = this.startDamage();    // ％蓄積（設計書 9／hellは100%スタート）
+    this.stocks = 3;                     // ストック（設計書 11）
+    this.dead = false;
+    this.invuln = 90;                    // 出現時無敵
+    this.hitstun = 0;
+    this.respawnTimer = 0;
+
+    this.weapon = 'bare';
+    this.boxOpen = false;
+    this.boxSel = 0;
+
+    // SP（設計書 8）
+    this.spActive = 0;                   // 残り効果フレーム
+    this.spCooldown = 0;                 // 残りCDフレーム
+
+    // シールド（Bボタン）
+    this.shield = this.shieldMax();      // 耐久（0でガード割れ／SUPER GARDは2倍）
+    this.shielding = false;              // 展開中
+    this.guardBreak = 0;                 // ガード割れスタン残りフレーム
+
+    // 算数（mathキャラ専用）
+    this.mathSelecting = false;          // 対象選択中
+    this.mathTargetIdx = 0;
+    this.mathCooldown = 0;               // 算数攻撃のクールタイム
+    this.mathFrozen = false;             // 出題されて静止中
+    this.mathProblem = null;             // {text, answer, choices}
+    this.mathTimer = 0; this.mathWrongFlash = 0;
+    this._mathAnsSeen = 0; this._mathTgtSeen = 0;
+
+    // 時間停止（timeキャラ）
+    this.timeStopped = 0;                // >0：完全停止中の残りフレーム
+    this.timeCooldown = 0;               // 時間停止のクールタイム
+
+    // スロー（slowキャラ）
+    this.slowed = 0;                     // >0：移動0.4倍にされている残りフレーム
+    this.slowCooldown = 0;               // スローのクールタイム
+
+    // お絵かき（Q2キャラ）
+    this.drawing = false;                // 線を描いている間は無防備で行動不能
+    this.drawBudget = 0;                 // 残り描画可能量（px）
+    this.drawCooldown = 0;               // 描画のクールタイム
+
+    // 攻撃状態
+    this.attack = null;                  // {move, dir, t, dur, hit:Set, weapon}
+    this.comboStep = 0; this.comboTimer = 0;
+
+    // アニメ用ポーズ（角度°：0=真下、+で前方）
+    this.pose = { lArm:18, rArm:18, lThigh:0, rThigh:0, lShin:8, rShin:8, lean:0, bob:0 };
+    this.cur  = Object.assign({}, this.pose);
+    this.animT = 0;
+    this.state = 'idle';
+  }
+
+  color() { const c = COLORS[this.colorIdx]; return this.dimColor ? c.dim : c.std; }
+
+  get moveSpeed() {
+    let s = this.def.speed;
+    if (this.spActive > 0) s *= 2;       // SP中×2（設計書 8）
+    if (this.dashBoost > 0) s *= DASH_MUL; // YOSENの加速スキル中×1.5
+    if (this.slowed > 0) s *= SLOW_FACTOR; // スロー中×0.4
+    return s;
+  }
+
+  bodyRect() { return { x: this.x - 16, y: this.y - 66, w: 32, h: 66 }; }
+
+  reset(spawn) {
+    this.x = spawn.x; this.y = spawn.y;
+    this.vx = 0; this.vy = 0;
+    this.damage = this.startDamage(); this.hitstun = 0; this.invuln = 90;
+    this.attack = null; this.boxOpen = false; this.comboStep = 0;
+    this.weapon = 'bare';
+    this.shield = this.shieldMax(); this.shielding = false; this.guardBreak = 0;
+    this.mathSelecting = false; this.mathFrozen = false; this.mathProblem = null;
+    this.timeStopped = 0; this.timeCooldown = 0; this.slowed = 0; this.slowCooldown = 0;
+    this.drawing = false; this.drawBudget = 0; this.drawCooldown = 0;
+    this.superPower = 0; this.superCooldown = 0;   // スーパーパワー：残り効果フレーム/CD
+    this.reverseMode = 0; this.reverseCooldown = 0; this.reversed = 0;   // リバース：発動残り/CD/被反転残り
+    this.mirrorCharges = MIRROR_MAX; this.mirrorCooldown = 0;   // MIRROR：残りチャージ/CD
+    this.isClone = false; this.ownerEid = 0; this.cloneHits = 0;   // 分身フラグ/親eid/被弾数
+    this.noJumpCooldown = 0; this.jumpBlocked = 0;   // noJumper：CD／自分がジャンプ封じされている残り
+    this.dashBoost = 0; this.dashCooldown = 0;   // YOSEN：加速残り／CD
+    this.shatterMode = 0; this.shatterCooldown = 0;   // HPOP：シールド一撃割り残り／CD
+    this.invincible = 0; this.invincCooldown = 0;   // YUTON：無敵残り／CD
+    this.bananaCooldown = 0; this.slipped = 0;   // BANANA：設置CD／自分が滑っている残り
+    this.bombCooldown = 0;   // ボム設置のクールタイム（武器ボム共通）
+    this.yHold = 0; this.charging = false;   // スマッシュ：Y押し続けフレーム／溜め中フラグ
+  }
+
+  // シールド耐久の最大値（SUPER GARDは2倍）
+  shieldMax() { return SHIELD_MAX * (this.def.shieldMul || 1); }
+
+  // スポーン時の初期ダメージ（hellは常に100%スタート）
+  startDamage() { return this.def.startDmg || 0; }
+
+  // このキャラ固有スキルのクールタイム（残りフレーム/最大）— 表示用
+  specialCD() {
+    if (this.def.id === 'chara_time') return this.timeCooldown;
+    if (this.def.id === 'chara_slow') return this.slowCooldown;
+    if (this.def.id === 'chara_math') return this.mathCooldown;
+    if (this.def.id === 'chara_q2')   return this.drawCooldown;
+    if (this.def.id === 'chara_superpower') return this.superCooldown;
+    if (this.def.id === 'chara_reverse') return this.reverseCooldown;
+    if (this.def.id === 'chara_mirror') return this.mirrorCooldown;
+    if (this.def.id === 'chara_nojumper') return this.noJumpCooldown;
+    if (this.def.id === 'chara_yosen') return this.dashCooldown;
+    if (this.def.id === 'chara_hpop') return this.shatterCooldown;
+    if (this.def.id === 'chara_yuton') return this.invincCooldown;
+    if (this.def.id === 'chara_banana') return this.bananaCooldown;
+    return 0;
+  }
+  specialCDMax() {
+    if (this.def.id === 'chara_time') return TIME_CD;
+    if (this.def.id === 'chara_slow') return SLOW_CD;
+    if (this.def.id === 'chara_math') return 480;
+    if (this.def.id === 'chara_q2')   return DRAW_CD;
+    if (this.def.id === 'chara_superpower') return SUPER_CD;
+    if (this.def.id === 'chara_reverse') return REVERSE_CD;
+    if (this.def.id === 'chara_mirror') return MIRROR_CD;
+    if (this.def.id === 'chara_nojumper') return NOJUMP_CD;
+    if (this.def.id === 'chara_yosen') return DASH_CD;
+    if (this.def.id === 'chara_hpop') return SHATTER_CD;
+    if (this.def.id === 'chara_yuton') return INVINC_CD;
+    if (this.def.id === 'chara_banana') return BANANA_CD;
+    return 0;
+  }
+
+  // アイテムボックスの選択肢（math/timeは6つ目に固有ボタン）
+  boxOptions() {
+    const opts = WEAPON_ORDER.map(w => ({ type:'weapon', weapon:w, icon:WEAPONS[w].icon, label:WEAPONS[w].label }));
+    if (this.def.id === 'chara_math') opts.push({ type:'math', icon:'🧮', label:'算数' });
+    if (this.def.id === 'chara_time') opts.push({ type:'time', icon:'⏱', label:'時間停止' });
+    if (this.def.id === 'chara_slow') opts.push({ type:'slow', icon:'🐌', label:'スロー' });
+    if (this.def.id === 'chara_q2')   opts.push({ type:'draw', icon:'✏️', label:'線を描く' });
+    if (this.def.id === 'chara_superpower') opts.push({ type:'super', icon:'💪', label:'スーパーパワー' });
+    if (this.def.id === 'chara_reverse') opts.push({ type:'reverse', icon:'🔄', label:'リバース' });
+    if (this.def.id === 'chara_mirror') opts.push({ type:'mirror', icon:'👥', label:'分身' });
+    if (this.def.id === 'chara_nojumper') opts.push({ type:'nojump', icon:'🚫', label:'ジャンプ封じ' });
+    if (this.def.id === 'chara_yosen') opts.push({ type:'dash', icon:'💨', label:'加速' });
+    if (this.def.id === 'chara_himan') opts.push({ type:'weapon', weapon:'daidaiken', icon:WEAPONS.daidaiken.icon, label:'大大剣' });
+    if (this.def.id === 'chara_hpop') opts.push({ type:'shatter', icon:'🛡️', label:'シールド粉砕' });
+    if (this.def.id === 'chara_yuton') opts.push({ type:'invinc', icon:'✨', label:'無敵' });
+    if (this.def.id === 'chara_banana') opts.push({ type:'banana', icon:'🍌', label:'バナナ設置' });
+    opts.push({ type:'bare', icon:'✊', label:'素手に戻す' });
+    return opts;
+  }
+  applyBoxSelection(world) {
+    const opts = this.boxOptions(), o = opts[this.boxSel];
+    if (!o) { this.boxOpen = false; return; }
+    if (o.type === 'weapon') { this.weapon = o.weapon; this.boxOpen = false; Sound.play('se_item_equip'); }
+    else if (o.type === 'bare') { this.weapon = 'bare'; this.boxOpen = false; Sound.play('se_item_equip'); }
+    else if (o.type === 'math') {
+      this.boxOpen = false;
+      if (this.mathCooldown > 0) { Sound.play('se_item_close'); return; }
+      const opp = world.fighters.filter(f => f !== this && !f.dead);
+      if (opp.length === 0) return;
+      this.mathSelecting = true; this.mathTargetIdx = 0; Sound.play('se_item_open');
+    }
+    else if (o.type === 'time') {
+      this.boxOpen = false;
+      if (this.timeCooldown > 0) { Sound.play('se_item_close'); return; }
+      this.timeCooldown = TIME_CD;
+      for (const other of world.fighters) { if (other !== this && !other.dead) other.timeStopped = TIME_STOP; }  // 全員の時間を止める
+      world.timeStopFlash = 30;       // 画面演出
+      Sound.play('se_timestop');
+    }
+    else if (o.type === 'slow') {
+      this.boxOpen = false;
+      if (this.slowCooldown > 0) { Sound.play('se_item_close'); return; }
+      this.slowCooldown = SLOW_CD;
+      for (const other of world.fighters) { if (other !== this && !other.dead) other.slowed = SLOW_DUR; }  // 全員を鈍化
+      Sound.play('se_slow');
+    }
+    else if (o.type === 'draw') {
+      this.boxOpen = false;
+      if (this.drawCooldown > 0) { Sound.play('se_item_close'); return; }   // クールタイム中は描けない
+      this.drawing = true; this.drawBudget = DRAW_BUDGET;  // 無防備で行動不能になり、描画モードへ
+      if (this.isHuman && typeof Game !== 'undefined') Game.drawMode = this;  // 自端末で描画UIを開く
+      Sound.play('se_item_open');
+    }
+    else if (o.type === 'super') {
+      this.boxOpen = false;
+      if (this.superCooldown > 0) { Sound.play('se_item_close'); return; }   // クールタイム中は発動不可
+      this.superPower = SUPER_DUR; this.superCooldown = SUPER_CD;            // 15秒間ノックバック1.7倍
+      Sound.play('se_special_ready');
+    }
+    else if (o.type === 'reverse') {
+      this.boxOpen = false;
+      if (this.reverseCooldown > 0) { Sound.play('se_item_close'); return; }   // クールタイム中は発動不可
+      this.reverseMode = REVERSE_DUR; this.reverseCooldown = REVERSE_CD;        // 10秒間：当てた相手の操作を反転
+      Sound.play('se_special_ready');
+    }
+    else if (o.type === 'mirror') {
+      this.boxOpen = false;
+      if (this.isClone) { Sound.play('se_item_close'); return; }                // 分身は分身を出せない
+      if (this.mirrorCharges <= 0) { Sound.play('se_item_close'); return; }     // 2体出し切ってCT中
+      this.spawnMirror(world);
+      this.mirrorCharges--;
+      if (this.mirrorCharges <= 0) this.mirrorCooldown = MIRROR_CD;             // 出し切ったらCT開始
+      Sound.play('se_special_ready');
+    }
+    else if (o.type === 'nojump') {
+      this.boxOpen = false;
+      if (this.noJumpCooldown > 0) { Sound.play('se_item_close'); return; }     // クールタイム中は発動不可
+      this.noJumpCooldown = NOJUMP_CD;
+      for (const other of world.fighters) { if (other !== this && !other.dead) other.jumpBlocked = NOJUMP_DUR; }  // 自分以外のジャンプを封じる
+      Sound.play('se_special_ready');
+    }
+    else if (o.type === 'dash') {
+      this.boxOpen = false;
+      if (this.dashCooldown > 0) { Sound.play('se_item_close'); return; }   // クールタイム中は発動不可
+      this.dashBoost = DASH_DUR; this.dashCooldown = DASH_CD;               // 8秒間、自分の速度1.5倍
+      Sound.play('se_special_activate');
+    }
+    else if (o.type === 'shatter') {
+      this.boxOpen = false;
+      if (this.shatterCooldown > 0) { Sound.play('se_item_close'); return; }   // クールタイム中は発動不可
+      this.shatterMode = SHATTER_DUR; this.shatterCooldown = SHATTER_CD;        // 30秒間、攻撃が相手のシールドを一撃で割る
+      Sound.play('se_special_activate');
+    }
+    else if (o.type === 'invinc') {
+      this.boxOpen = false;
+      if (this.invincCooldown > 0) { Sound.play('se_item_close'); return; }   // クールタイム中は発動不可
+      this.invincible = INVINC_DUR; this.invincCooldown = INVINC_CD;          // 10秒間無敵
+      Sound.play('se_special_activate');
+    }
+    else if (o.type === 'banana') {
+      this.boxOpen = false;
+      if (this.bananaCooldown > 0) { Sound.play('se_item_close'); return; }   // クールタイム中は設置不可
+      world.bananas.push({ x: this.x, y: this.y, life: BANANA_LIFE, ownerEid: this.eid });   // 足元に設置
+      this.bananaCooldown = BANANA_CD;
+      Sound.play('se_item_equip');
+    }
+  }
+  // 攻撃する分身（トレーニングのCPUボット）を自分の隣に召喚。5発食らうと消滅し、自分には攻撃が当たらない
+  spawnMirror(world) {
+    const clone = new Fighter(this.def.id, this.colorIdx, { bot:true, botMode:'cpu', dim:true, label:'分身' });
+    clone.controller = new CPUController('cpu');
+    clone.reset({ x: this.x - this.facing * 44, y: this.y - 4 });   // 先に通常初期化してから分身化
+    clone.isClone = true; clone.ownerEid = this.eid; clone.cloneHits = 0;
+    clone.mirrorCharges = 0; clone.stocks = 1;
+    clone.weapon = this.weapon;   // 生成時点でオーナーが持っている武器を引き継ぎ、その武器で攻撃する
+    world.fighters.push(clone);
+  }
+  // 描いた線の長さ分だけ予算を消費。使い切ったら描画終了＋クールタイム
+  consumeDrawBudget(len) {
+    this.drawBudget -= len;
+    if (this.drawBudget <= 0) this.endDrawing();
+  }
+  endDrawing() {
+    if (this.drawing) { this.drawing = false; this.drawCooldown = DRAW_CD; }
+  }
+  confirmMathTarget(t) {
+    this.mathSelecting = false;
+    if (!t || t.dead) return;
+    this.mathCooldown = 480;              // 8秒CD
+    t.applyMathFreeze();
+    Sound.play('se_special_activate');
+  }
+  applyMathFreeze() {
+    this.mathFrozen = true; this.mathProblem = genMathProblem(); this.mathTimer = 0; this.mathWrongFlash = 0;
+  }
+  solveMath() { this.mathFrozen = false; this.mathProblem = null; Sound.play('se_special_ready'); }
+  nextMathProblem() { this.mathProblem = genMathProblem(); this.mathWrongFlash = 14; Sound.play('se_item_close'); }
+  submitMathAnswer(v) {
+    if (!this.mathFrozen || !this.mathProblem) return;
+    if (v === this.mathProblem.answer) this.solveMath(); else this.nextMathProblem();
+  }
+
+  // クライアント側予測：自キャラの移動・ジャンプ・重力だけローカルで即時反映（入力遅延の解消）
+  predictStep(ctrl) {
+    const dx = ctrl.dirX();
+    if (dx !== 0) { this.vx = lerp(this.vx, dx * this.moveSpeed, 0.4); this.facing = dx; }
+    else this.vx *= this.grounded ? FRICTION_G : FRICTION_A;
+    if (ctrl.edge.X && this.jumpsLeft > 0 && this.jumpBlocked <= 0) { this.vy = JUMP_V; this.jumpsLeft--; this.grounded = false; }
+    this.vy += GRAVITY; if (this.vy > 22) this.vy = 22;
+    const prevFeet = this.y;
+    this.x += this.vx; this.y += this.vy;
+    this.grounded = false;
+    if (this.vy >= 0) {
+      for (const p of PLATFORMS) {
+        if (this.x > p.x1 - 14 && this.x < p.x2 + 14 && prevFeet <= p.y + 6 && this.y >= p.y && this.y - this.vy <= p.y + 8) {
+          this.y = p.y; this.vy = 0; this.grounded = true; break;
+        }
+      }
+    }
+    if (this.grounded) this.jumpsLeft = this.def.jumps;
+  }
+
+  /* ---- 入力適用（人間 or CPU が held/edge を直接セットする想定。ここでは状態更新のみ） ---- */
+  update(world, ctrl) {
+    if (this.dead) return;
+
+    if (this.respawnTimer > 0) { this.respawnTimer--; if (this.respawnTimer === 0) this.reset(SPAWN[0]); return; }
+    // 時間停止中：いかなる操作・物理も行わずその場で完全停止（自分の時間も止まる）
+    if (this.timeStopped > 0) {
+      this.timeStopped--; this.vx = 0; this.vy = 0;
+      if (this.timeStopped === 0) Sound.play('se_timeresume');
+      return;
+    }
+    if (this.invuln > 0) this.invuln--;
+    if (this.hitstun > 0) this.hitstun--;
+    if (this.spActive > 0) this.spActive--;
+    if (this.spCooldown > 0) { this.spCooldown--; if (this.spCooldown === 0) Sound.play('se_special_ready'); }
+    if (this.comboTimer > 0) this.comboTimer--; else this.comboStep = 0;
+    if (this.mathCooldown > 0) this.mathCooldown--;
+    if (this.timeCooldown > 0) this.timeCooldown--;
+    if (this.slowCooldown > 0) this.slowCooldown--;
+    if (this.slowed > 0) this.slowed--;
+    if (this.drawCooldown > 0) this.drawCooldown--;
+    if (this.superPower > 0) this.superPower--;
+    if (this.superCooldown > 0) this.superCooldown--;
+    if (this.reverseMode > 0) this.reverseMode--;
+    if (this.reverseCooldown > 0) this.reverseCooldown--;
+    if (this.reversed > 0) this.reversed--;
+    if (this.mirrorCooldown > 0) { this.mirrorCooldown--; if (this.mirrorCooldown === 0) this.mirrorCharges = MIRROR_MAX; }
+    if (this.noJumpCooldown > 0) this.noJumpCooldown--;
+    if (this.jumpBlocked > 0) this.jumpBlocked--;
+    if (this.dashBoost > 0) this.dashBoost--;
+    if (this.dashCooldown > 0) this.dashCooldown--;
+    if (this.shatterMode > 0) this.shatterMode--;
+    if (this.shatterCooldown > 0) this.shatterCooldown--;
+    if (this.invincible > 0) this.invincible--;
+    if (this.invincCooldown > 0) this.invincCooldown--;
+    if (this.bananaCooldown > 0) this.bananaCooldown--;
+    if (this.slipped > 0) this.slipped--;
+    if (this.bombCooldown > 0) this.bombCooldown--;
+    // ネット越しの描画入力（リモートQ2のストローク/描画終了をホストで反映）
+    if (ctrl) {
+      if (ctrl.drawNew) {
+        ctrl.drawNew = false;
+        if (this.drawing && ctrl.drawPts && ctrl.drawPts.length >= 2) {
+          world.doodles.push(new Doodle(ctrl.drawPts, this)); if (world.doodles.length > 10) world.doodles.shift();
+          this.consumeDrawBudget(strokeLen(ctrl.drawPts));
+        }
+      }
+      if (ctrl.endDrawNew) { ctrl.endDrawNew = false; this.endDrawing(); }
+    }
+
+    // ---- シールド（Bボタン）状態更新 ----
+    if (this.guardBreak > 0) {
+      this.guardBreak--;
+      if (this.guardBreak === 0) this.shield = this.shieldMax() * 0.6;   // 復帰時に一部回復
+    }
+    const canShield = this.hitstun <= 0 && this.guardBreak <= 0 && !this.boxOpen && this.grounded && !this.attack
+                      && !this.mathFrozen && !this.mathSelecting && !this.drawing && this.slipped <= 0 && this.def.id !== 'chara_hpop';
+    this.shielding = canShield && !!ctrl.held.B && this.shield > 0;
+    if (this.shielding) {
+      this.shield -= SHIELD_DRAIN;
+      if (this.shield <= 0) this.breakGuard();
+    } else if (this.guardBreak <= 0 && this.shield < this.shieldMax()) {
+      this.shield = Math.min(this.shieldMax(), this.shield + SHIELD_REGEN);
+    }
+    if (this.mathWrongFlash > 0) this.mathWrongFlash--;
+
+    const controllable = this.hitstun <= 0 && !this.boxOpen && this.guardBreak <= 0 && !this.shielding
+                         && !this.mathFrozen && !this.mathSelecting && !this.drawing;
+
+    // ---- アイテムボックス操作（設計書 7） ----
+    if (this.drawing) {
+      this.vx *= FRICTION_G;               // お絵かき中：無防備で行動不能（その場で停止）
+    } else if (this.boxOpen) {
+      this.vx *= FRICTION_G;
+      const n = this.boxOptions().length;
+      if (ctrl.edge.left)  { this.boxSel = (this.boxSel + n - 1) % n; Sound.play('se_ui_select'); }
+      if (ctrl.edge.right) { this.boxSel = (this.boxSel + 1) % n; Sound.play('se_ui_select'); }
+      if (ctrl.edge.A) this.applyBoxSelection(world);   // 装備/算数を実行して閉じる
+      if (ctrl && ctrl.boxPickNew) { ctrl.boxPickNew = false; this.boxSel = ctrl.boxPickVal % n; this.applyBoxSelection(world); }
+    } else if (this.mathSelecting) {
+      // 算数の対象を選ぶ（左右で切替・Aで決定・Bでキャンセル）
+      this.vx *= FRICTION_G;
+      const opp = world.fighters.filter(f => f !== this && !f.dead);
+      if (opp.length === 0) { this.mathSelecting = false; }
+      else {
+        this.mathTargetIdx = ((this.mathTargetIdx % opp.length) + opp.length) % opp.length;
+        if (ctrl.edge.left)  this.mathTargetIdx = (this.mathTargetIdx + opp.length - 1) % opp.length;
+        if (ctrl.edge.right) this.mathTargetIdx = (this.mathTargetIdx + 1) % opp.length;
+        if (ctrl.edge.A) this.confirmMathTarget(opp[this.mathTargetIdx]);
+        if (ctrl.edge.B) this.mathSelecting = false;
+        if (ctrl && ctrl.mathTgtNew) { ctrl.mathTgtNew = false; this.confirmMathTarget(opp[ctrl.mathTgtVal % opp.length]); }
+      }
+    } else if (this.mathFrozen) {
+      // 出題されて静止。CPUは自動回答、回答UIは描画側（人間）
+      this.vx *= FRICTION_G;
+      if (this.isBot) {
+        this.mathTimer++;
+        if (this.mathTimer >= 100) { this.mathTimer = 0; if (Math.random() < 0.55) this.solveMath(); else this.nextMathProblem(); }
+      } else if (ctrl && ctrl.mathAnsNew) {
+        ctrl.mathAnsNew = false; this.submitMathAnswer(ctrl.mathAnsVal);
+      }
+    } else if (this.shielding) {
+      this.vx *= FRICTION_G;            // シールド中は動けない
+    } else if (this.slipped > 0) {
+      this.vx *= 0.985;                 // バナナで滑走：摩擦ほぼ無し・操作不能
+    } else if (this.guardBreak > 0) {
+      this.vx *= FRICTION_G;            // ガード割れ：行動不能
+    } else if (controllable) {
+      // ---- A：ボックスを開く ----
+      if (ctrl.edge.A) { this.boxOpen = true; this.boxSel = 0; Sound.play('se_item_open'); }
+      // ---- Y：タップ=通常攻撃／長押し=スマッシュ（離した瞬間に発動。溜め中は足を止める） ----
+      if (this.attack) { this.yHold = 0; this.charging = false; }
+      else if (ctrl.held.Y) { this.yHold++; if (this.yHold >= SMASH_HOLD) this.charging = true; }
+      else { if (this.yHold > 0) this.startAttack(ctrl.dir(), world, this.yHold >= SMASH_HOLD); this.yHold = 0; this.charging = false; }
+      const smashing = this.charging || (this.attack && this.attack.move && this.attack.move.isSmash);
+      // ---- 移動（スマッシュ中は足を止める。溜め中は向きだけ変えられる） ----
+      let dx = (ctrl.moveX ? ctrl.moveX() : ctrl.dirX());
+      if (this.reversed > 0) dx = -dx;   // リバース被弾中：移動入力が逆になる
+      if (smashing) {
+        this.vx *= FRICTION_G;
+        if (!this.attack && Math.abs(dx) > 0.05) this.facing = dx > 0 ? 1 : -1;
+      } else if (Math.abs(dx) > 0.05) {
+        this.vx = lerp(this.vx, dx * this.moveSpeed, 0.4);
+        this.facing = dx > 0 ? 1 : -1;
+      } else {
+        this.vx *= this.grounded ? FRICTION_G : FRICTION_A;
+      }
+      // ---- X：ジャンプ（スマッシュ中は不可／スロー中はジャンプ力0.4倍／ジャンプ封じ中は不可） ----
+      if (ctrl.edge.X && this.jumpsLeft > 0 && this.jumpBlocked <= 0 && !smashing) {
+        this.vy = JUMP_V * (this.slowed > 0 ? SLOW_FACTOR : 1); this.jumpsLeft--; this.grounded = false;
+        const used = this.def.jumps - this.jumpsLeft;
+        Sound.play(used === 1 ? 'se_jump' : used === 2 ? 'se_jump2' : 'se_jump3');
+      }
+      // ---- SP：スペシャル（設計書 8） ----
+      if (ctrl.edge.SP && this.spCooldown <= 0 && this.spActive <= 0) {
+        this.spActive = 600;            // 10秒 @60fps
+        this.spCooldown = 1200;         // 20秒
+        Sound.play('se_special_activate');
+      }
+    } else {
+      this.vx *= this.grounded ? FRICTION_G : FRICTION_A;
+    }
+
+    // ---- 攻撃の進行 ----
+    if (this.attack) {
+      this.attack.t++;
+      if (this.attack.fwd) this.vx = this.facing * this.attack.fwd * (1 - this.attack.t / this.attack.dur);
+      if (this.attack.t >= this.attack.dur) this.attack = null;
+    }
+
+    // ---- 物理 ----
+    this.vy += GRAVITY;
+    if (this.vy > 22) this.vy = 22;
+    const prevFeet = this.y;
+    this.x += this.vx;
+    this.y += this.vy;
+
+    // ---- プラットフォーム衝突（一方通行：下からはすり抜け・設計書 10） ----
+    this.grounded = false;
+    if (this.vy >= 0) {
+      for (const p of PLATFORMS) {
+        if (this.x > p.x1 - 14 && this.x < p.x2 + 14 && prevFeet <= p.y + 6 && this.y >= p.y && this.y - this.vy <= p.y + 8) {
+          this.y = p.y; this.vy = 0; this.grounded = true; break;
+        }
+      }
+    }
+    if (this.grounded) {
+      if (this.jumpsLeft < this.def.jumps && this.vy === 0 && this._wasAir) Sound.play('se_land');
+      this.jumpsLeft = this.def.jumps;
+    }
+    this._wasAir = !this.grounded;
+
+    // ---- 場外バースト判定（設計書 11） ----
+    if (this.invuln <= 0 && (this.x < STAGE.blastL || this.x > STAGE.blastR || this.y > STAGE.blastBottom || this.y < STAGE.blastTop)) {
+      this.burst(world);
+    }
+
+    this.updateAnim(ctrl);
+  }
+
+  burst(world) {
+    Sound.play('se_burst');
+    if (this.isClone) { this.dead = true; this._remove = true; return; }   // 分身は場外でも即消滅（勝敗・ストックに影響なし）
+    this.stocks--;
+    Sound.play('se_stock_lost');
+    this.damage = this.startDamage();    // ストック消失でリセット（hellは100%スタート）
+    if (this.stocks <= 0) {
+      this.stocks = 0; this.dead = true;
+      world.onPlayerOut(this);
+    } else {
+      this.x = -9999;                    // 一旦退避
+      this.respawnTimer = 70;
+      this.vx = this.vy = 0;
+    }
+  }
+
+  startAttack(dir, world, smash) {
+    const wk = this.weapon;
+    // ボム：斬撃ではなく足元に設置（2秒後に爆発）。クールタイム4秒
+    if (wk === 'bomb') {
+      if (this.bombCooldown > 0) { Sound.play('se_item_close'); return; }
+      world.bombs.push({ x: this.x, y: this.y, fuse: BOMB_FUSE, ownerEid: this.eid });
+      this.bombCooldown = BOMB_CD;
+      Sound.play('se_item_open');
+      return;
+    }
+    // スマッシュ：方向に応じた5種の攻撃をダメージ1.2倍・ノックバック2.5倍で発動
+    if (smash) {
+      const tbl = WEAPONS[wk].attacks;
+      let key = dir;
+      if (!this.grounded && tbl.air) key = 'air';
+      else if (!tbl[key]) key = tbl.none ? 'none' : 'side';
+      let m = tbl[key] || tbl.side || tbl.none;   // 素手のnoneはコンボなので無い→sideで代用
+      if (!m) return;
+      if (m.airOnly && this.grounded) return;
+      if (m.groundOnly && !this.grounded) return;
+      const sm = Object.assign({}, m, { dmg: m.dmg * SMASH_DMG_MUL, kb: m.kb * SMASH_KB_MUL,
+        kbg: (m.kbg || 0.08) * SMASH_KB_MUL, knockback: true, isSmash: true, name: '💥' + m.name });
+      this.spawnAttack(sm, key, world);
+      if (sm.proj) Sound.play('se_gun_shot');
+      else if (wk === 'tachi' || wk === 'daiken' || wk === 'daidaiken') Sound.play('se_sword_swing');
+      else if (wk === 'glove') Sound.play('se_glove_hit');
+      else Sound.play('se_punch3_kb');
+      return;
+    }
+    // 素手ニュートラルは3段コンボ（設計書 6.1）
+    if (wk === 'bare' && dir === 'none' && this.grounded) {
+      const step = this.comboStep % 3;
+      const dmgs = [3, 3, 6], kb = [2, 2.5, 7], kbg = [0.02, 0.02, 0.11];
+      const move = { name:'3段パンチ', dmg:dmgs[step], kb:kb[step], kbg:kbg[step],
+                     reach:50, h:55, isCombo:true, knockback: step === 2 };
+      this.spawnAttack(move, dir, world);
+      this.comboStep = step + 1; this.comboTimer = 28;
+      Sound.play(step === 0 ? 'se_punch1' : step === 1 ? 'se_punch2' : 'se_punch3_kb');
+      return;
+    }
+    let key = dir;
+    const tbl = WEAPONS[wk].attacks;
+    if (!this.grounded && tbl.air) key = 'air';          // 空中はair優先
+    else if (!tbl[key]) key = tbl.none ? 'none' : 'side';
+    const move = tbl[key];
+    if (!move) return;
+    if (move.airOnly && this.grounded) return;
+    if (move.groundOnly && !this.grounded) return;
+    this.spawnAttack(move, key, world);
+    // 効果音（武器別・設計書 15.2）
+    if (move.proj) Sound.play('se_gun_shot');
+    else if (wk === 'tachi' || wk === 'daiken' || wk === 'daidaiken') Sound.play('se_sword_swing');
+    else if (wk === 'lance') Sound.play('se_lance_thrust');
+    else if (wk === 'glove') Sound.play('se_glove_hit');
+    else Sound.play('se_punch2');
+  }
+
+  spawnAttack(move, dir, world) {
+    const startup = move.startup || 4;
+    this.attack = { move, dir, t:0, dur: startup + 12, active:[startup, startup+9],
+                    hit:new Set(), weapon:this.weapon, fwd: move.fwd || 0 };
+    this.state = dir === 'air' ? 'atk_air' : ('atk_' + (dir === 'none' ? 'n' : dir));
+    // 飛び道具
+    if (move.proj) {
+      const n = move.parts || 1;
+      for (let i = 0; i < n; i++) {
+        setTimeout(() => {
+          if (this.dead) return;
+          let vy = 0, vx = this.facing * 16;
+          if (move.proj === 'up') { vx = this.facing * 12; vy = -10; }
+          if (move.proj === 'down') { vx = this.facing * 12; vy = 10; }
+          world.projectiles.push(new Projectile(this, this.x + this.facing * 24, this.y - 38, vx, vy, move));
+          Sound.play('se_gun_shot');
+        }, i * 90);
+      }
+    }
+  }
+
+  // 攻撃の当たり判定（近接）
+  attackHitbox() {
+    if (!this.attack) return null;
+    const a = this.attack;
+    if (a.t < a.active[0] || a.t > a.active[1]) return null;
+    if (a.move.proj) return null;
+    const reach = a.move.reach || 50, h = a.move.h || 55;
+    const x = this.facing > 0 ? this.x : this.x - reach;
+    let yTop = this.y - 60;
+    if (a.dir === 'up') yTop = this.y - 60 - (h - 55);
+    if (a.dir === 'down') yTop = this.y - 30;
+    return { x: x, y: yTop, w: reach, h: h };
+  }
+
+  breakGuard() {
+    this.shield = 0; this.shielding = false;
+    this.guardBreak = GUARD_BREAK_STUN;     // 2秒間行動不能
+    this.vx = 0;
+    Sound.play('se_stock_lost');
+    spawnHitSpark(this.x, this.y - 40);
+  }
+
+  receiveHit(move, attacker, world) {
+    if (this.invuln > 0 || this.invincible > 0 || this.dead || this.respawnTimer > 0) return;
+    this.charging = false; this.yHold = 0;   // 被弾でスマッシュ溜めはキャンセル
+    // ---- シールドで防御：ダメージ/吹っ飛び無効、耐久を削る ----
+    if (this.shielding && this.guardBreak <= 0) {
+      if (attacker.shatterMode > 0) { this.breakGuard(); return; }   // HPOPの粉砕：一撃でガードを割る
+      this.shield -= (move.dmg * SHIELD_HIT_FACTOR);
+      const dir = (attacker.x <= this.x) ? 1 : -1;
+      this.vx = dir * 2;                     // わずかに押される
+      Sound.play('se_weapon_hit');
+      spawnHitSpark(this.x + dir * 18, this.y - 40);
+      if (this.shield <= 0) this.breakGuard();
+      return;
+    }
+    const dealt = move.dmg * attacker.def.atk;
+    this.damage += dealt * this.def.def;           // 与ダメ×攻撃倍率, 被ダメ×防御倍率（設計書 5）
+    // 吹っ飛び（設計書 9）：dist = (kb + dmg% × kbg) / 体重 × 100 × 被ダメ係数
+    let mag = (move.kb + this.damage * (move.kbg || 0.08)) * (100 / this.def.weight) * this.def.def;
+    if (attacker.superPower > 0) mag *= SUPER_KB;   // スーパーパワー発動中：ノックバック1.7倍
+    mag *= (attacker.def.kbDealtMul || 1);          // hell等：相手を吹っ飛ばす距離の倍率
+    if (attacker.reverseMode > 0) this.reversed = REVERSE_HIT;   // リバース発動中の攻撃を受けた相手は操作反転
+    const dir = (attacker.x <= this.x) ? 1 : -1;
+    let ux = dir, uy = -0.5;
+    if (move.up) uy = -1.4;
+    if (move.spike) uy = 1.2;
+    const len = Math.hypot(ux, uy);
+    this.vx = (ux / len) * mag;
+    this.vy = (uy / len) * mag;
+    this.hitstun = Math.min(8 + Math.floor(mag * 1.2), 50);
+    this.facing = -dir;                            // 吹っ飛んだ方向に向く（設計書 18）
+    this.grounded = false;
+    // 効果音
+    if (move.proj) Sound.play('se_gun_hit');
+    else if (attacker.weapon !== 'bare') Sound.play('se_weapon_hit');
+    else if (move.knockback) Sound.playHitWithDamage(this.damage);
+    else Sound.play('se_punch1');
+    spawnHitSpark(this.x, this.y - 40);
+    // 分身：攻撃を食らった数を数え、5発でいなくなる
+    if (this.isClone && ++this.cloneHits >= MIRROR_HITS) { this.dead = true; this._remove = true; }
+  }
+
+  /* ---- アニメーション（設計書 17.2） ---- */
+  updateAnim(ctrl) {
+    this.animT += 1;
+    const moving = Math.abs(this.vx) > 0.6;
+    let st;
+    if (this.netMode) {
+      // クライアント：ホストから受信した state をそのまま使う（ローカル物理は無し）
+      st = this.state || 'idle';
+    } else {
+      st = 'idle';
+      if (this.guardBreak > 0) st = 'guardbreak';
+      else if (this.shielding) st = 'shield';
+      else if (this.hitstun > 0) st = this.vy < -3 || Math.abs(this.vx) > 6 ? 'launched' : 'hitstun';
+      else if (this.attack) st = this.state;
+      else if (!this.grounded) st = this.vy < 0 ? 'jump_up' : 'jump_air';
+      else if (moving) st = 'run';
+      this.state = st;
+    }
+
+    const t = this.animT;
+    const P = this.pose;
+    if (st === 'idle') {
+      P.bob = Math.sin(t * 0.09) * 2; P.lArm = 18; P.rArm = 18;
+      P.lThigh = 3; P.rThigh = -3; P.lShin = 6; P.rShin = 6; P.lean = 0;
+    } else if (st === 'run') {
+      const phase = t * 0.35 * (this.moveSpeed / 5);
+      const swing = Math.sin(phase) * 35;          // 太もも±35°（設計書 17.2）
+      P.lThigh = swing; P.rThigh = -swing;
+      P.lShin = swing > 0 ? swing * 0.6 : -swing * 0.3;
+      P.rShin = swing < 0 ? -swing * 0.6 : swing * 0.3;
+      P.lArm = -swing * 0.7 + 15; P.rArm = swing * 0.7 + 15; // 腕は逆位相
+      P.lean = 10; P.bob = Math.abs(Math.sin(phase)) * 2;
+    } else if (st === 'jump_up') {
+      P.lThigh = 30; P.rThigh = 20; P.lShin = 40; P.rShin = 35; P.lArm = 120; P.rArm = 120; P.lean = 0; P.bob = 0;
+    } else if (st === 'jump_air') {
+      P.lThigh = 18; P.rThigh = -18; P.lShin = 20; P.rShin = 20; P.lArm = 60; P.rArm = 60; P.lean = 0;
+    } else if (st === 'hitstun') {
+      P.lArm = 70; P.rArm = 70; P.lean = -25; P.lThigh = -10; P.rThigh = 10; P.lShin = 10; P.rShin = 10;
+    } else if (st === 'launched') {
+      // 全身回転は描画側で spin
+      P.lArm = 100; P.rArm = -40; P.lThigh = 40; P.rThigh = -20; P.lShin = 10; P.rShin = 30; P.lean = -20;
+    } else if (st === 'shield') {
+      // やや屈んで両腕を前に構える
+      P.lArm = 58; P.rArm = 58; P.lean = 6; P.lThigh = 14; P.rThigh = -14; P.lShin = 20; P.rShin = 20; P.bob = 0;
+    } else if (st === 'guardbreak') {
+      // ふらつき（行動不能）
+      P.lArm = 28; P.rArm = -28; P.lean = Math.sin(t * 0.5) * 16; P.lThigh = 6; P.rThigh = -6; P.lShin = 8; P.rShin = 8; P.bob = 0;
+    } else {
+      // 攻撃ポーズ（即時反映：キビキビ感・設計書 17.2）
+      this.applyAttackPose(P, st);
+    }
+
+    // 攻撃は即時、それ以外は補間
+    const k = (st.startsWith('atk') ) ? 1 : 0.25;
+    for (const key of ['lArm','rArm','lThigh','rThigh','lShin','rShin','lean','bob']) {
+      this.cur[key] = lerp(this.cur[key], P[key], k);
+    }
+    // 向き補間（設計書 18）
+    this.curFlipX = lerp(this.curFlipX, this.facing, 0.18);
+    if (Math.abs(this.curFlipX - this.facing) < 0.02) this.curFlipX = this.facing;
+  }
+
+  applyAttackPose(P, st) {
+    P.lThigh = 5; P.rThigh = -5; P.lShin = 6; P.rShin = 6; P.bob = 0;
+    switch (st) {
+      case 'atk_n':  P.rArm = 95; P.lArm = 10; P.lean = 12; break;
+      case 'atk_side': P.rArm = 92; P.lArm = 92; P.lean = 25; break;
+      case 'atk_up': P.rArm = 175; P.lArm = 160; P.lean = -10; break;
+      case 'atk_down': P.rArm = 30; P.lArm = 20; P.lean = 30; P.lThigh = 40; P.rThigh = -40; break;
+      case 'atk_air': P.rArm = 130; P.lArm = 50; P.lean = 0; break;
+      default: P.rArm = 95; P.lArm = 15; P.lean = 12;
+    }
+  }
+}
+
+/* ======================= 7. Projectile（銃弾） ======================= */
+class Projectile {
+  constructor(owner, x, y, vx, vy, move) {
+    this.owner = owner; this.x = x; this.y = y; this.vx = vx; this.vy = vy;
+    this.move = move; this.life = 70; this.dead = false;
+  }
+  update(world) {
+    this.x += this.vx; this.y += this.vy;
+    if (this.move.proj === 'up' || this.move.proj === 'down') this.vy += 0.3;
+    this.life--;
+    if (this.life <= 0 || this.x < -50 || this.x > W + 50 || this.y > H + 50) this.dead = true;
+    for (const f of world.fighters) {
+      if (f === this.owner || f.dead || f.respawnTimer > 0 || f.invuln > 0 || f.invincible > 0) continue;
+      if (this.owner.isClone && f.eid === this.owner.ownerEid) continue;   // 分身の弾はオーナーに当たらない
+      const r = f.bodyRect();
+      if (this.x > r.x && this.x < r.x + r.w && this.y > r.y && this.y < r.y + r.h) {
+        f.receiveHit(this.move, this.owner, world);
+        this.dead = true; break;
+      }
+    }
+  }
+  draw(ctx) {
+    ctx.fillStyle = '#ffe066';
+    ctx.beginPath(); ctx.arc(this.x, this.y, 5, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = 'rgba(255,200,80,0.4)';
+    ctx.fillRect(this.x - this.vx, this.y - 2, this.vx, 4);
+  }
+}
+
+/* ======================= 7.5 Doodle（Q2の白線：落下して転がる障害物） ======================= */
+class Doodle {
+  // pts: ワールド座標の点列, owner: 描いた本人（ノックバック免除）
+  constructor(pts, owner) {
+    let cx = 0, cy = 0; for (const p of pts) { cx += p.x; cy += p.y; } cx /= pts.length; cy /= pts.length;
+    this.x = cx; this.y = cy;
+    this.pts = pts.map(p => ({ x: p.x - cx, y: p.y - cy }));   // 中心からの相対座標
+    let r = 8; for (const p of this.pts) r = Math.max(r, Math.hypot(p.x, p.y));
+    this.radius = r;
+    this.len = strokeLen(pts);                       // 描いた線の総長
+    this.kb = 3 + Math.min(this.len / 80, 9);        // 3〜12：線が長いほどノックバックが強い
+    this.ownerEid = owner ? owner.eid : -1;
+    this.vx = 0; this.vy = 0; this.angle = 0; this.angVel = 0;
+    this.grounded = false; this.life = 600;          // 約10秒で消滅
+    this.hitCd = {};                                 // eid -> 連続ヒット防止
+  }
+  update(world) {
+    this.life--;
+    if (!this.grounded) {
+      this.vy += GRAVITY * 0.5; this.x += this.vx; this.y += this.vy;
+      if (this.vy >= 0 && this.x > STAGE.main.x1 && this.x < STAGE.main.x2 && this.y + this.radius >= STAGE.main.y) {
+        this.y = STAGE.main.y - this.radius; this.vy = 0; this.grounded = true;
+        this.angVel = (Math.random() < 0.5 ? -1 : 1) * 0.035;  // 着地で転がり出す（速度50%減）
+      }
+    } else {
+      this.vx = this.angVel * this.radius;           // 転がり：回転と移動を連動
+      this.x += this.vx; this.angle += this.angVel;
+      this.angVel *= 0.99; if (Math.abs(this.angVel) < 0.004) this.angVel = 0;
+      if (this.x < STAGE.main.x1 || this.x > STAGE.main.x2) this.grounded = false;  // 端から落下
+    }
+    if (this.x < STAGE.blastL - 60 || this.x > STAGE.blastR + 60 || this.y > STAGE.blastBottom + 100) this.life = 0;
+    // 当たり判定（本人以外を少しノックバック）
+    for (const f of world.fighters) {
+      if (f.dead || f.respawnTimer > 0 || f.eid === this.ownerEid || f.invincible > 0) continue;
+      if ((this.hitCd[f.eid] || 0) > 0) { this.hitCd[f.eid]--; continue; }
+      const r = f.bodyRect();
+      const dx = Math.max(r.x - this.x, 0, this.x - (r.x + r.w));
+      const dy = Math.max(r.y - this.y, 0, this.y - (r.y + r.h));
+      if (Math.hypot(dx, dy) < this.radius - 2) {
+        const dir = (this.x <= f.x) ? 1 : -1;
+        f.vx = dir * this.kb; f.vy = -Math.min(2 + this.kb * 0.4, 6);     // 線が長いほど強くノックバック
+        f.hitstun = Math.max(f.hitstun, 6 + Math.floor(this.kb)); f.facing = -dir;
+        this.hitCd[f.eid] = 24;
+        Sound.play('se_punch1');
+      }
+    }
+  }
+  draw(ctx) {
+    ctx.save();
+    ctx.translate(this.x, this.y); ctx.rotate(this.angle);
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 4; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    if (this.life < 90) ctx.globalAlpha = this.life / 90;   // 消滅前にフェード
+    ctx.beginPath();
+    this.pts.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+/* ======================= 8. ヒットスパーク ======================= */
+const sparks = [];
+function spawnHitSpark(x, y) { sparks.push({ x, y, t: 0, life: 14 }); }
+function updateSparks() { for (let i = sparks.length - 1; i >= 0; i--) { if (++sparks[i].t >= sparks[i].life) sparks.splice(i, 1); } }
+function drawSparks(ctx) {
+  for (const s of sparks) {
+    const p = s.t / s.life, r = 8 + p * 22;
+    ctx.strokeStyle = `rgba(255,${200 - p * 150},80,${1 - p})`;
+    ctx.lineWidth = 3;
+    for (let a = 0; a < 6; a++) {
+      const ang = a * Math.PI / 3 + p;
+      ctx.beginPath();
+      ctx.moveTo(s.x + Math.cos(ang) * r * 0.4, s.y + Math.sin(ang) * r * 0.4);
+      ctx.lineTo(s.x + Math.cos(ang) * r, s.y + Math.sin(ang) * r);
+      ctx.stroke();
+    }
+  }
+}
+
+/* ======================= 9. 棒人間レンダラ（設計書 17） ======================= */
+function drawLeg(ctx, hipX, hipY, thighAngle, shinBend, thighLen, shinLen) {
+  const ta = thighAngle * Math.PI / 180;
+  const kneeX = hipX + Math.sin(ta) * thighLen;
+  const kneeY = hipY + Math.cos(ta) * thighLen;
+  const sa = (thighAngle + shinBend) * Math.PI / 180;
+  const footX = kneeX + Math.sin(sa) * shinLen;
+  const footY = kneeY + Math.cos(sa) * shinLen;
+  ctx.beginPath(); ctx.moveTo(hipX, hipY); ctx.lineTo(kneeX, kneeY); ctx.lineTo(footX, footY); ctx.stroke();
+}
+function drawArm(ctx, shX, shY, angle, len) {
+  // angle: 0=真下, 90=前方水平(+x), 180=真上
+  const a = angle * Math.PI / 180;
+  const fx = shX + Math.sin(a) * len, fy = shY - Math.cos(a) * len;
+  ctx.beginPath(); ctx.moveTo(shX, shY); ctx.lineTo(fx, fy); ctx.stroke();
+}
+function drawCharacter(ctx, f) {
+  const c = f.cur;
+  ctx.save();
+  ctx.translate(f.x, f.y - c.bob);
+  ctx.scale(f.curFlipX, 1);
+
+  // 吹っ飛び中は全身回転（設計書 17.2 launched）
+  if (f.state === 'launched') ctx.rotate(Math.sin(f.animT * 0.4) * 0.9);
+  // バナナで滑走中はぐるぐる揺れる
+  if (f.slipped > 0) ctx.rotate(Math.sin(f.animT * 0.7) * 0.55);
+
+  ctx.strokeStyle = f.color();
+  ctx.lineWidth = 3;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+
+  // SP発動中：光らせる（設計書 8）
+  if (f.spActive > 0) { ctx.shadowColor = f.color(); ctx.shadowBlur = 18; }
+  // スマッシュ溜め中：赤く脈打つ光
+  if (f.charging) { ctx.shadowColor = '#ff5a2a'; ctx.shadowBlur = 12 + Math.sin(f.animT * 0.5) * 8; }
+  // 無敵点滅
+  if (f.invuln > 0 && Math.floor(f.invuln / 4) % 2 === 0) ctx.globalAlpha = 0.4;
+
+  if (f.def.id === 'chara_banana') {
+    drawBananaBody(ctx, f);
+  } else {
+    const hipY = -FOOT;                 // 腰
+    const leanRad = c.lean * Math.PI / 180;
+    const neckY = hipY - 28;            // 胴体長28
+    const neckX = Math.sin(leanRad) * 28;
+    // 脚（腰オフセット±5・設計書 17.1/17.2）
+    drawLeg(ctx, -5, hipY, c.lThigh, c.lShin, 13, 12);
+    drawLeg(ctx,  5, hipY, c.rThigh, c.rShin, 13, 12);
+    // 胴体
+    ctx.beginPath(); ctx.moveTo(0, hipY); ctx.lineTo(neckX, neckY); ctx.stroke();
+    // 腕（肩＝首付近）
+    drawArm(ctx, neckX, neckY + 4, c.lArm + c.lean, 20);
+    drawArm(ctx, neckX, neckY + 4, c.rArm + c.lean, 20);
+    // 武器の簡易表示
+    drawWeaponInHand(ctx, f, neckX, neckY + 4, c.rArm + c.lean);
+    // 頭
+    const headX = neckX + Math.sin(leanRad) * 12, headY = neckY - 12;
+    ctx.beginPath(); ctx.arc(headX, headY, 12, 0, Math.PI * 2); ctx.stroke();
+  }
+
+  ctx.restore();
+  ctx.globalAlpha = 1; ctx.shadowBlur = 0;
+
+  // ---- シールド（バブル）描画：耐久に応じて大きさ・色が変化 ----
+  if (f.shielding && f.shield > 0) {
+    const ratio = Math.max(0, Math.min(1, f.shield / f.shieldMax()));
+    const r = (26 + ratio * 18) * (f.def.guardScale || 1);   // SUPER GARDはガード表示2倍
+    const hue = 120 * ratio;                       // 緑(満)→赤(減)
+    ctx.save();
+    ctx.fillStyle = `hsla(${hue},90%,55%,0.28)`;
+    ctx.strokeStyle = `hsla(${hue},90%,65%,0.9)`;
+    ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(f.x, f.y - 34, r, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    ctx.restore();
+  }
+  // ---- ガード割れ：頭上に「!」スタン表示 ----
+  if (f.guardBreak > 0) {
+    ctx.save();
+    ctx.fillStyle = '#ffd166';
+    ctx.font = 'bold 26px sans-serif'; ctx.textAlign = 'center';
+    const wob = Math.sin(f.animT * 0.4) * 6;
+    ctx.fillText('💢', f.x + wob, f.y - 78);
+    ctx.restore();
+  }
+  // ---- 時間停止中：青いオーラ＋時計マーク ----
+  if (f.timeStopped > 0) {
+    ctx.save();
+    ctx.strokeStyle = 'rgba(120,200,255,0.8)'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.ellipse(f.x, f.y - 33, 22, 40, 0, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = '#bfe6ff'; ctx.font = '24px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('⏱', f.x, f.y - 80);
+    ctx.restore();
+  }
+  // ---- 鈍化中：紫のオーラ＋カタツムリ ----
+  else if (f.slowed > 0) {
+    ctx.save();
+    ctx.fillStyle = '#c9a8ff'; ctx.font = '22px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('🐌', f.x, f.y - 80);
+    ctx.restore();
+  }
+  // ---- SUPER POWER：効果時間バー（このキャラ専用、頭上に残り時間を表示） ----
+  if (f.superPower > 0) {
+    const bw = 64, bh = 9, bx = f.x - bw/2, by = f.y - 96;
+    const p = Math.max(0, Math.min(1, f.superPower / SUPER_DUR));
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    roundRect(ctx, bx - 2, by - 2, bw + 4, bh + 4, 4); ctx.fill();
+    ctx.fillStyle = p > 0.3 ? '#ffb347' : '#ff6b6b';        // 残り少で赤に
+    roundRect(ctx, bx, by, bw * p, bh, 3); ctx.fill();
+    ctx.strokeStyle = '#ffe0a3'; ctx.lineWidth = 1.5;
+    roundRect(ctx, bx, by, bw, bh, 3); ctx.stroke();
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 13px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('💪' + Math.ceil(f.superPower / 60) + 's', f.x, by - 5);
+    ctx.restore();
+  }
+  // ---- リバース被弾中：操作が逆になっている合図 ----
+  if (f.reversed > 0) {
+    ctx.save();
+    const wob = Math.sin(f.animT * 0.3) * 5;
+    ctx.fillStyle = '#ff9de2'; ctx.font = '22px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('🔄', f.x + wob, f.y - 80);
+    ctx.restore();
+  }
+  // ---- ジャンプ封じ中：頭上に🚫 ----
+  if (f.jumpBlocked > 0) {
+    ctx.save();
+    ctx.fillStyle = '#ff6b6b'; ctx.font = '22px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('🚫', f.x, f.y - 100);
+    ctx.restore();
+  }
+  // ---- HPOPシールド粉砕モード中：頭上に🛡️ ----
+  if (f.shatterMode > 0) {
+    ctx.save();
+    ctx.fillStyle = '#ffd166'; ctx.font = '22px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('🛡️💥', f.x, f.y - 100);
+    ctx.restore();
+  }
+  // ---- 無敵中（YUTON）：金色のオーラ＋✨ ----
+  if (f.invincible > 0) {
+    ctx.save();
+    ctx.strokeStyle = 'rgba(255,215,80,0.85)'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.ellipse(f.x, f.y - 33, 26, 44, 0, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = '#ffd166'; ctx.font = '22px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('✨', f.x, f.y - 100);
+    ctx.restore();
+  }
+  // ---- バナナで滑走中：頭上に💫 ----
+  if (f.slipped > 0) {
+    ctx.save();
+    ctx.font = '22px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('💫', f.x, f.y - 96);
+    ctx.restore();
+  }
+}
+// BANANA：一本の太い棒（バナナ）の体。移動で傾き、攻撃時は前方へ振る
+function drawBananaBody(ctx, f) {
+  ctx.save();
+  ctx.scale(f.curFlipX, 1);                 // 外側のflipを打ち消す（棒は左右対称）
+  let tilt = Math.max(-0.5, Math.min(0.5, f.vx * 0.03));   // 移動速度に応じて傾く
+  if (f.attack) { const pr = f.attack.t / f.attack.dur; tilt += Math.sin(pr * Math.PI) * 0.85 * f.facing; }  // 攻撃は前方へ振る
+  ctx.rotate(tilt);
+  const HW = 13, H = 66;                     // 半幅・高さ
+  const grad = ctx.createLinearGradient(-HW, 0, HW, 0);
+  grad.addColorStop(0, '#d9a915'); grad.addColorStop(0.45, '#ffe14d'); grad.addColorStop(1, '#caa00f');
+  ctx.fillStyle = grad; ctx.strokeStyle = '#6e5300'; ctx.lineWidth = 3; ctx.lineJoin = 'round';
+  roundRect(ctx, -HW, -H, HW * 2, H, HW); ctx.fill(); ctx.stroke();
+  ctx.strokeStyle = '#5a4500'; ctx.lineWidth = 6; ctx.lineCap = 'round';   // ヘタ
+  ctx.beginPath(); ctx.moveTo(0, -H); ctx.lineTo(0, -H - 9); ctx.stroke();
+  ctx.fillStyle = '#3a2a00';                 // 目
+  ctx.beginPath(); ctx.arc(-5, -H + 20, 2.6, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(5, -H + 20, 2.6, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+// 設置された爆弾（導火線が点滅、爆発間近で速く・赤く）
+function drawBomb(ctx, b) {
+  const fuse = (b.fuse !== undefined) ? b.fuse : BOMB_FUSE;
+  const fast = fuse < 45;
+  ctx.save();
+  ctx.translate(b.x, b.y - 13);
+  if (fast && Math.floor(fuse / 4) % 2 === 0) { ctx.shadowColor = '#ff5a2a'; ctx.shadowBlur = 16; }   // 爆発間近で赤く光る
+  ctx.fillStyle = '#222'; ctx.strokeStyle = '#000'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(0, 0, 13, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = 'rgba(255,255,255,0.25)'; ctx.beginPath(); ctx.arc(-4, -4, 4, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = '#a8732a'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(0, -13); ctx.quadraticCurveTo(9, -22, 4, -29); ctx.stroke();
+  if (Math.floor(Date.now() / (fast ? 70 : 150)) % 2 === 0) {   // 火花
+    ctx.fillStyle = fast ? '#ff5a2a' : '#ffd14d';
+    ctx.beginPath(); ctx.arc(4, -31, 3.5, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.restore();
+}
+// 地面に置かれたバナナ（三日月）
+function drawGroundBanana(ctx, b) {
+  ctx.save();
+  ctx.translate(b.x, b.y - 5);
+  if (b.life !== undefined && b.life < 120 && Math.floor(b.life / 8) % 2 === 0) ctx.globalAlpha = 0.4;  // 消える前に点滅
+  ctx.strokeStyle = '#6e5300'; ctx.lineWidth = 11; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.arc(0, 6, 15, Math.PI * 1.12, Math.PI * 1.88); ctx.stroke();
+  ctx.strokeStyle = '#ffe14d'; ctx.lineWidth = 7;
+  ctx.beginPath(); ctx.arc(0, 6, 15, Math.PI * 1.12, Math.PI * 1.88); ctx.stroke();
+  ctx.restore();
+  ctx.globalAlpha = 1;
+}
+function drawWeaponInHand(ctx, f, shX, shY, armAngle) {
+  if (f.weapon === 'bare') return;
+  const a = armAngle * Math.PI / 180;
+  const hx = shX + Math.sin(a) * 20, hy = shY - Math.cos(a) * 20;
+  ctx.save();
+  ctx.translate(hx, hy);
+  ctx.strokeStyle = '#cfd8e8'; ctx.fillStyle = '#cfd8e8'; ctx.lineWidth = 3;
+  switch (f.weapon) {
+    case 'gun':   ctx.fillRect(0, -3, 16, 6); break;
+    case 'tachi': ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(30,-18); ctx.stroke(); break;
+    case 'daiken':ctx.lineWidth=6; ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(34,-22); ctx.stroke(); break;
+    case 'daidaiken':ctx.lineWidth=9; ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(64,-42); ctx.stroke(); break;
+    case 'bomb':  ctx.fillStyle = '#222'; ctx.beginPath(); ctx.arc(10, -2, 7, 0, Math.PI*2); ctx.fill();
+                  ctx.strokeStyle = '#a8732a'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(10,-9); ctx.lineTo(14,-15); ctx.stroke(); break;
+    case 'glove': ctx.beginPath(); ctx.arc(8,-4,7,0,Math.PI*2); ctx.fill(); break;
+  }
+  ctx.restore();
+}
+
+/* ======================= 10. World（試合進行） ======================= */
+class World {
+  constructor(fighters, opts = {}) {
+    this.fighters = fighters;
+    this.projectiles = [];
+    this.doodles = [];                    // Q2の白線（落書き）
+    this.bananas = [];                    // BANANAの設置バナナ
+    this.bombs = [];                      // 武器ボムの設置爆弾
+    this.training = !!opts.training;
+    this.over = false; this.winner = null;
+    this.placements = [];                 // 脱落順（後ろが上位）
+    let i = 0; for (const f of fighters) f.reset(SPAWN[i++ % SPAWN.length]);
+  }
+  onPlayerOut(f) {
+    this.placements.push(f);
+    if (this.training) return;            // トレーニングは脱落なし扱い
+    const alive = this.fighters.filter(x => !x.dead && !x.isClone);
+    if (alive.length <= 1) {
+      this.over = true;
+      this.winner = alive[0] || f;
+      Sound.play('se_win');
+    }
+  }
+  update() {
+    for (const f of this.fighters) {
+      const ctrl = f.controller;          // 各fighterに割り当てた入力源
+      ctrl.poll(f, this);                 // held/edge を更新
+      f.update(this, ctrl);
+    }
+    // 近接ヒット解決
+    for (const a of this.fighters) {
+      const hb = a.attackHitbox(); if (!hb) continue;
+      for (const b of this.fighters) {
+        if (b === a || b.dead || a.attack.hit.has(b.eid)) continue;
+        if (a.isClone && b.eid === a.ownerEid) continue;   // 分身→オーナーには当たらない
+        if (rectsOverlap(hb, b.bodyRect())) {
+          a.attack.hit.add(b.eid);
+          b.receiveHit(a.attack.move, a, this);
+        }
+      }
+    }
+    for (let i = this.projectiles.length - 1; i >= 0; i--) {
+      this.projectiles[i].update(this);
+      if (this.projectiles[i].dead) this.projectiles.splice(i, 1);
+    }
+    for (let i = this.doodles.length - 1; i >= 0; i--) {
+      this.doodles[i].update(this);
+      if (this.doodles[i].life <= 0) this.doodles.splice(i, 1);
+    }
+    // ボム：導火線を進め、0で爆発。半径内の全員（設置者本人も）へダメージ＋ノックバック
+    for (let i = this.bombs.length - 1; i >= 0; i--) {
+      const bo = this.bombs[i];
+      bo.fuse--;
+      if (bo.fuse <= 0) {
+        const atk = { x: bo.x, def: { atk: 1 }, superPower: 0, reverseMode: 0 };   // 爆心からの簡易攻撃者
+        for (const f of this.fighters) {
+          if (f.dead || f.respawnTimer > 0) continue;
+          if (Math.hypot(f.x - bo.x, (f.y - 33) - (bo.y - 20)) < BOMB_R) f.receiveHit(BOMB_MOVE, atk, this);
+        }
+        spawnHitSpark(bo.x, bo.y - 20); spawnHitSpark(bo.x - 24, bo.y - 30); spawnHitSpark(bo.x + 24, bo.y - 30);
+        Sound.play('se_burst');
+        this.bombs.splice(i, 1);
+      }
+    }
+    // バナナ：寿命管理＋接触した相手を滑らせる
+    for (let i = this.bananas.length - 1; i >= 0; i--) {
+      const ba = this.bananas[i];
+      ba.life--;
+      let hit = false;
+      for (const f of this.fighters) {
+        if (f.dead || f.respawnTimer > 0 || f.eid === ba.ownerEid || f.slipped > 0 || f.invincible > 0) continue;
+        if (Math.abs(f.x - ba.x) < 22 && Math.abs(f.y - ba.y) < 30) {
+          f.slipped = SLIP_DUR;
+          f.vx = (f.vx !== 0 ? Math.sign(f.vx) : (f.facing || 1)) * 9;   // 進行方向へツルッと
+          f.vy = -4; f.grounded = false;
+          Sound.play('se_item_close');
+          hit = true; break;
+        }
+      }
+      if (hit || ba.life <= 0) this.bananas.splice(i, 1);
+    }
+    updateSparks();
+    if (this.fighters.some(f => f._remove)) this.fighters = this.fighters.filter(f => !f._remove);   // 消えた分身を除去（元プレイヤーは順序維持）
+  }
+}
+
+/* ======================= 11. 入力コントローラ（人間/CPU） ======================= */
+// 人間：グローバル Input をそのまま使う
+const HumanController = {
+  edge:{}, held:{},
+  poll(f) {
+    this.edge = Input.edge; this.held = Input.held;
+  },
+  dirX(){ return Input.dirX(); },
+  moveX(){ return Input.moveX(); },
+  dir(){ return Input.dir(); },
+};
+
+// CPU（設計書 14）
+class CPUController {
+  constructor(mode) { this.mode = mode; this._held = {}; this.edge = {}; this.held = {}; this._t = Math.random()*100; }
+  dirX(){ return this.held.right ? 1 : this.held.left ? -1 : 0; }
+  moveX(){ return this.dirX(); }
+  dir(){ if (this.held.up) return 'up'; if (this.held.down) return 'down'; if (this.held.left||this.held.right) return 'side'; return 'none'; }
+  poll(self, world) {
+    const prev = Object.assign({}, this.held);
+    this.held = { left:false,right:false,up:false,down:false,X:false,Y:false,A:false,B:false,SP:false };
+    this._t++;
+    if (this.mode === 'static') { this.edge = {}; return; }   // 静止モード（設計書 14）
+
+    // 最も近い敵
+    let target = null, best = 1e9;
+    for (const o of world.fighters) {
+      if (o === self || o.dead || o.respawnTimer > 0) continue;
+      if (self.isClone && (o.eid === self.ownerEid || o.isClone)) continue;   // 分身はオーナー/他の分身を狙わない
+      const d = Math.abs(o.x - self.x); if (d < best) { best = d; target = o; }
+    }
+    if (target) {
+      const dx = target.x - self.x;
+      // 接近
+      if (Math.abs(dx) > 60) { if (dx > 0) this.held.right = true; else this.held.left = true; }
+      // 台に戻る／上の敵へジャンプ
+      if (!self.grounded && self.y > STAGE.main.y - 30 && self.x > STAGE.main.x1 && self.x < STAGE.main.x2) {
+        // 落下中：復帰ジャンプ
+      }
+      if ((self.x < STAGE.main.x1 || self.x > STAGE.main.x2) && self.y > 200 && this._t % 18 === 0) this.held.X = true; // 復帰
+      if (target.y < self.y - 60 && this._t % 40 === 0) this.held.X = true;  // 上の敵へ
+      // 攻撃（接触したら確率で）
+      if (Math.abs(dx) < 70 && Math.abs(target.y - self.y) < 70) {
+        if (Math.random() < 0.06) this.held.Y = true;
+      }
+      // 低確率で武器装備
+      if (!self.boxOpen && Math.random() < 0.002) { this.held.A = true; this._wantEquip = 1 + Math.floor(Math.random()*5); }
+      if (self.boxOpen) {
+        // 適当に選んで装備
+        if (Math.random() < 0.3) this.held.A = true;
+      }
+      // たまにSP
+      if (self.spCooldown <= 0 && Math.random() < 0.003) this.held.SP = true;
+    }
+    this.edge = {};
+    for (const k in this.held) this.edge[k] = this.held[k] && !prev[k];
+  }
+}
+
+// リモート入力（ホスト側：他プレイヤーの入力をRTDBから反映）
+class RemoteController {
+  constructor() {
+    this.held = { left:false,right:false,up:false,down:false,X:false,Y:false,A:false,B:false,SP:false };
+    this.edge = {};
+    this.data = null;
+    this._c = { X:0, Y:0, A:0, B:0, SP:0 };   // 受信したボタン押下カウンタ
+    this._bs = 0; this._ma = 0; this._mt = 0;  // 箱選択/算数回答/算数対象 のシーケンス
+    this._dr = 0; this._ed = 0;                // 描画ストローク/描画終了 のシーケンス
+  }
+  setData(d) { this.data = d; }
+  dirX(){ return (this.held.right?1:0) - (this.held.left?1:0); }
+  moveX(){ return (this.ax != null) ? this.ax : this.dirX(); }  // ネット越しのアナログ横入力
+  dir(){ if (this.held.up) return 'up'; if (this.held.down) return 'down'; if (this.held.left||this.held.right) return 'side'; return 'none'; }
+  poll(self) {
+    const d = this.data || {};
+    const prev = Object.assign({}, this.held);
+    // B（シールド）は長押し保持、それ以外はカウンタ増分でタップ検出
+    this.held = { left:!!d.l, right:!!d.r, up:!!d.u, down:!!d.d, X:false, Y:!!d.sy, A:false, B:!!d.sb, SP:false };
+    this.ax = (d.ax != null) ? d.ax / 100 : (this.held.right ? 1 : this.held.left ? -1 : 0);  // アナログ横入力
+    this.edge = {};
+    for (const k of ['X','Y','A','SP']) {
+      const c = d['c' + k] || 0;
+      if (c > this._c[k]) { this.edge[k] = true; this.held[k] = true; }
+      this._c[k] = c;
+    }
+    this.edge.left  = this.held.left  && !prev.left;
+    this.edge.right = this.held.right && !prev.right;
+    // タッチ操作（箱選択/算数）のシーケンス検出
+    if ((d.bsSeq || 0) > this._bs) { this._bs = d.bsSeq; this.boxPickNew = true; this.boxPickVal = d.bs || 0; }
+    if ((d.maSeq || 0) > this._ma) { this._ma = d.maSeq; this.mathAnsNew = true; this.mathAnsVal = d.ma || 0; }
+    if ((d.mtSeq || 0) > this._mt) { this._mt = d.mtSeq; this.mathTgtNew = true; this.mathTgtVal = d.mt || 0; }
+    if ((d.drSeq || 0) > this._dr) { this._dr = d.drSeq; this.drawNew = true; this.drawPts = (d.dr || []).map(p => ({ x: p[0], y: p[1] })); }
+    if ((d.edSeq || 0) > this._ed) { this._ed = d.edSeq; this.endDrawNew = true; }
+  }
+}
+
+/* ======================= 12. シーン管理 ======================= */
+const Game = {
+  canvas:null, ctx:null,
+  scale:1, ox:0, oy:0,
+  scene:'title',
+  mode:'training',          // 'training' | 'versus'
+  world:null,
+  ui:[],                    // 当該フレームのボタン
+  // 選択状態
+  sel: { charIdx:0, colorIdx:0, botChar:2, botMode:'cpu', confirmed:false },
+  versusPlayers: 4,
+  countdown:0, countNum:3,
+  resultTimer:0,
+  // ネット
+  net:null, room:null,
+
+  init() {
+    this.canvas = document.getElementById('game');
+    this.ctx = this.canvas.getContext('2d');
+    Input.init();
+    this.bindPointers();
+    this.resize();
+    window.addEventListener('resize', () => this.resize());
+    window.addEventListener('orientationchange', () => setTimeout(() => this.resize(), 250));
+    // ビジュアルビューポート（アドレスバー開閉）に追従してCanvasを再配置
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', () => this.resize());
+      window.visualViewport.addEventListener('scroll', () => this.resize());
+    }
+    requestAnimationFrame(() => this.loop());
+  },
+  resize() {
+    // 実表示領域（visualViewport）にぴったり収める。Canvasを可視領域の中央に絶対配置し、
+    // スマホ横画面でも下部UI（ボタン）が見切れないようにする
+    const vv = window.visualViewport;
+    const vw = (vv && vv.width)  || window.innerWidth;
+    const vh = (vv && vv.height) || window.innerHeight;
+    const offX = (vv && vv.offsetLeft) || 0;
+    const offY = (vv && vv.offsetTop)  || 0;
+    const cv = this.canvas, wrap = cv.parentElement;
+    // CSSのmax-width/height(100%)による高さ圧縮（＝横伸び・タップずれ）を防ぐ。
+    // 縦横は下で同じ倍率sを明示指定するのでアスペクト比(16:9)は保たれる。
+    cv.style.maxWidth = 'none'; cv.style.maxHeight = 'none';
+    // 全体フィット・中央固定・スクロール一切禁止のシーン（対戦中＋タイトル）。
+    // それ以外（各選択/説明/リザルト等）は幅にフィットして大きく表示し、縦に収まらなければスクロール可。
+    const battleView = (this.scene === 'battle' || this.scene === 'countdown' || this.scene === 'title');
+    let s;
+    if (battleView) {
+      s = Math.min(vw / W, vh / H);
+      const cw = W * s, ch = H * s;
+      cv.style.position = 'fixed';
+      cv.style.margin = '0';
+      cv.style.left = Math.round(offX + (vw - cw) / 2) + 'px';
+      cv.style.top  = Math.round(offY + (vh - ch) / 2) + 'px';
+      cv.style.width = cw + 'px';
+      cv.style.height = ch + 'px';
+      cv.style.touchAction = 'none';        // パン無効＝スクロールさせない
+      cv.removeAttribute('data-scroll');
+      if (wrap) wrap.scrollTop = 0;
+      if (window.scrollX || window.scrollY) window.scrollTo(0, 0);
+    } else {
+      s = Math.min(vw / W, 1);
+      const cw = W * s, ch = H * s;
+      cv.style.position = 'static';
+      cv.style.left = ''; cv.style.top = '';
+      cv.style.margin = '0 auto';
+      cv.style.width = cw + 'px';
+      cv.style.height = ch + 'px';
+      cv.style.touchAction = 'pan-y';       // 縦パン（スクロール）を許可
+      cv.setAttribute('data-scroll', '');   // touchmoveハンドラのスクロール許可対象に
+      if (wrap) wrap.style.alignItems = (ch <= vh ? 'center' : 'flex-start');  // 収まる時は中央／はみ出す時は上寄せ
+    }
+    const r = cv.getBoundingClientRect();
+    this.scale = s; this.ox = r.left; this.oy = r.top;
+  },
+  toCanvas(cx, cy) {
+    const r = this.canvas.getBoundingClientRect();
+    return { x: (cx - r.left) / this.scale, y: (cy - r.top) / this.scale };
+  },
+  bindPointers() {
+    const cv = this.canvas;
+    cv.addEventListener('pointerdown', e => {
+      Sound.unlock();
+      const p = this.toCanvas(e.clientX, e.clientY);
+      // お絵かきモード中：ボタン以外のドラッグは描画開始
+      if (this.scene === 'battle' && this.drawMode) {
+        if (this.handleUIClick(p.x, p.y)) return;
+        this.strokeStart(e.pointerId, p.x, p.y);
+        return;
+      }
+      if (this.scene === 'battle') Input.onPointerDown(e.pointerId, p.x, p.y);
+      this.handleUIClick(p.x, p.y);
+    });
+    cv.addEventListener('pointermove', e => {
+      const p = this.toCanvas(e.clientX, e.clientY);
+      if (this.scene === 'battle' && this.drawMode) { this.strokeMove(e.pointerId, p.x, p.y); return; }
+      Input.onPointerMove(e.pointerId, p.x, p.y);
+    });
+    cv.addEventListener('pointerup',   e => { if (this.drawMode) this.strokeEnd(e.pointerId); Input.onPointerUp(e.pointerId); });
+    cv.addEventListener('pointercancel', e => { if (this.drawMode) this.strokeEnd(e.pointerId); Input.onPointerUp(e.pointerId); });
+  },
+  handleUIClick(x, y) {
+    if (this._errored) { this._errored = false; this.scene = 'title'; this.world = null; return true; }
+    for (const b of this.ui) {
+      if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) {
+        Sound.play('se_ui_decide'); b.action(x, y); return true;
+      }
+    }
+    return false;
+  },
+  /* ---- Q2 お絵かき：ストローク管理 ---- */
+  strokeStart(id, x, y) { this._stroke = { id, pts: [{ x, y }] }; },
+  strokeMove(id, x, y) {
+    const s = this._stroke; if (!s || s.id !== id) return;
+    const last = s.pts[s.pts.length - 1];
+    if (Math.hypot(x - last.x, y - last.y) > 8) s.pts.push({ x, y });   // 8px間隔で点を追加
+    if (s.pts.length > 80) s.pts.shift();
+  },
+  strokeEnd(id) {
+    const s = this._stroke; if (!s || s.id !== id) { this._stroke = null; return; }
+    this._stroke = null;
+    if (s.pts.length >= 2 && this.world) {
+      const owner = this.drawMode;
+      if (this.world.netRole === 'client') { this._drawSend = { pts: s.pts, seq: (this._drawSeq = (this._drawSeq || 0) + 1) }; }
+      else {
+        this.world.doodles.push(new Doodle(s.pts, owner)); if (this.world.doodles.length > 10) this.world.doodles.shift();
+        if (owner) owner.consumeDrawBudget(strokeLen(s.pts));   // ローカル/ホストは予算を消費
+      }
+      Sound.play('se_item_close');
+      if (owner && !owner.drawing) this.exitDrawMode();   // 予算切れで描画終了したら自動でモード解除
+    }
+  },
+  exitDrawMode() {
+    if (this.drawMode) { this.drawMode.endDrawing(); }   // 完了でクールタイム開始（既に終了済みなら何もしない）
+    if (this.world && this.world.netRole === 'client') this._endDraw = { seq: (this._endDrawSeq = (this._endDrawSeq || 0) + 1) };
+    this.drawMode = null; this._stroke = null;
+  },
+  drawDrawingUI(ctx) {
+    // 描画中のストローク
+    if (this._stroke && this._stroke.pts.length) {
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 4; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      ctx.beginPath(); this._stroke.pts.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)); ctx.stroke();
+    }
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 22px sans-serif';
+    ctx.fillText('✏️ ドラッグで線を描く（離すと落ちて転がる）', W/2, 40);
+    ctx.fillStyle = '#ff8080'; ctx.font = '16px sans-serif';
+    ctx.fillText('描画中は無防備！', W/2, 66);
+    this.btn(W - 180, H - 84, 160, 60, '完了', () => this.exitDrawMode(), { color:'#2e8b57', font:26 });
+  },
+  btn(x, y, w, h, label, action, opts = {}) {
+    this.ui.push({ x, y, w, h, label, action, opts });
+  },
+
+  /* ---------- メインループ ---------- */
+  loop() {
+    try {
+      // シーンが切り替わったらレイアウト（スクロール可否・拡縮）を更新
+      if (this.scene !== this._layoutScene) { this._layoutScene = this.scene; this.resize(); }
+      Input.update();
+      this.ui = [];
+      const ctx = this.ctx;
+      ctx.clearRect(0, 0, W, H);
+      switch (this.scene) {
+        case 'title':      this.sceneTitle(); break;
+        case 'mode':       this.sceneModeSelect(); break;
+        case 'charselect': this.sceneCharSelect(); break;
+        case 'stageselect':this.sceneStageSelect(); break;
+        case 'countdown':  this.sceneCountdown(); break;
+        case 'battle':     this.sceneBattle(); break;
+        case 'result':     this.sceneResult(); break;
+        case 'help':       this.sceneHelp(); break;
+      }
+      this.drawButtons();
+    } catch (err) {
+      // 例外で「グレー画面のまま無反応」になるのを防ぎ、原因を画面に出す
+      this.drawError(err);
+      console.error('[スンマ戦] loop error:', err);
+    }
+    requestAnimationFrame(() => this.loop());
+  },
+
+  drawError(err) {
+    const ctx = this.ctx;
+    ctx.fillStyle = '#220000'; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#ff6b6b'; ctx.textAlign = 'left'; ctx.font = 'bold 28px monospace';
+    ctx.fillText('⚠ エラーが発生しました（scene: ' + this.scene + '）', 40, 80);
+    ctx.fillStyle = '#fff'; ctx.font = '18px monospace';
+    const msg = (err && (err.stack || err.message || String(err))) || 'unknown';
+    msg.split('\n').slice(0, 12).forEach((line, i) => ctx.fillText(line.slice(0, 110), 40, 130 + i * 26));
+    ctx.fillStyle = '#9fb3d1'; ctx.font = '16px sans-serif';
+    ctx.fillText('画面をタップ/クリックでタイトルに戻ります', 40, H - 50);
+    this._errored = true;
+  },
+
+  drawButtons() {
+    const ctx = this.ctx;
+    for (const b of this.ui) {
+      if (b.opts.bare) continue;          // bareは独自描画
+      ctx.fillStyle = b.opts.color || (b.opts.sel ? '#3a6ea5' : '#26324d');
+      roundRect(ctx, b.x, b.y, b.w, b.h, 10); ctx.fill();
+      ctx.strokeStyle = b.opts.sel ? '#ffd166' : '#4a5a7a'; ctx.lineWidth = b.opts.sel ? 4 : 2; ctx.stroke();
+      ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.font = (b.opts.font || 26) + 'px sans-serif';
+      ctx.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2);
+    }
+  },
+
+  /* ---------- タイトル（設計書 3.1） ---------- */
+  sceneTitle() {
+    const ctx = this.ctx;
+    bgGradient(ctx);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 120px sans-serif';
+    ctx.shadowColor = '#ffd166'; ctx.shadowBlur = 30;
+    ctx.fillText('スンマ戦', W/2, 240);
+    ctx.shadowBlur = 0;
+    // 右上の案内（全画面化の方法）
+    ctx.textAlign = 'right'; ctx.fillStyle = '#9fb3d1'; ctx.font = '17px sans-serif';
+    ctx.fillText('📱 全画面で遊ぶには共有から', W - 24, 44);
+    ctx.fillText('ホーム画面に追加してから起動してください', W - 24, 70);
+    ctx.textAlign = 'center';
+    // 左上：ページ更新（ホーム画面起動＝全画面表示だとブラウザの更新ボタンが無いため）
+    this.btn(24, 24, 150, 52, '🔄 更新', () => { location.reload(); }, { color:'#3a4a6a', font:22 });
+    this.btn(W/2 - 180, 332, 360, 58, 'トレーニングモード', () => { this.mode = 'training'; this.scene = 'charselect'; this.resetSelect(); });
+    this.btn(W/2 - 180, 398, 360, 58, '対戦モード', () => { this.startVersus(); });
+    this.btn(W/2 - 180, 464, 360, 58, '🎮 操作説明', () => { this.scene = 'help'; }, { color:'#3a4a6a' });
+    this.btn(W/2 - 180, 530, 360, 58, '📝 キャラリクエスト', () => { this.openCharRequest(); }, { color:'#5a4a7a' });
+    // ---- サウンドエフェクト：オン/オフ ＋ オン時の音量調整 ----
+    const seOn = Sound.isEnabled();
+    this.btn(W/2 - 300, 610, 200, 50, seOn ? '🔊 SE: ON' : '🔇 SE: OFF',
+      () => { Sound.toggle(); }, { color: seOn ? '#2e8b57' : '#5a3a3a', font:22 });
+    if (seOn) {
+      const bx = W/2 - 70, by = 610, bw = 370, bh = 50;
+      const vol = Sound.getVolume();
+      const tx = bx + 18, tw = bw - 36, ty = by + bh / 2;
+      ctx.fillStyle = '#26324d'; roundRect(ctx, bx, by, bw, bh, 10); ctx.fill();
+      ctx.strokeStyle = '#4a5a7a'; ctx.lineWidth = 2; roundRect(ctx, bx, by, bw, bh, 10); ctx.stroke();
+      ctx.strokeStyle = '#1b2336'; ctx.lineWidth = 8; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(tx, ty); ctx.lineTo(tx + tw, ty); ctx.stroke();
+      ctx.strokeStyle = '#ffd166';
+      ctx.beginPath(); ctx.moveTo(tx, ty); ctx.lineTo(tx + tw * vol, ty); ctx.stroke();
+      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(tx + tw * vol, ty, 11, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#cfe0ff'; ctx.font = 'bold 18px sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText('🔊 音量 ' + Math.round(vol * 100) + '%（バーをタップ）', bx + bw / 2, by - 14);
+      // バー全体をタップ判定にして、その位置の音量へ
+      this.btn(bx, by, bw, bh, '', (px) => { Sound.setVolume((px - tx) / tw); Sound.play('se_ui_select'); }, { bare:true });
+    } else {
+      ctx.fillStyle = '#9aa6bd'; ctx.font = '18px sans-serif'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      ctx.fillText('SEはオフです', W/2 - 50, 635);
+      ctx.textBaseline = 'alphabetic';
+    }
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#6b7a99'; ctx.font = '15px sans-serif';
+    ctx.fillText('スマホ: 左スティック + 右ボタン / PC: ←→移動 K=ジャンプ J=攻撃 L=アイテム B=シールド Space=SP', W/2, 698);
+  },
+
+  openCharRequest() {
+    if (window.Net && window.Net.available() && window.Net.openRequestUI) {
+      this.scene = 'room';                 // canvasは描画せずDOMオーバーレイに任せる
+      window.Net.openRequestUI(this);
+    } else {
+      alert('キャラリクエストにはオンライン設定（Firebase）が必要です。');
+    }
+  },
+
+  /* ---------- 操作説明 ---------- */
+  sceneHelp() {
+    const ctx = this.ctx; bgGradient(ctx);
+    ctx.textAlign = 'center'; ctx.fillStyle = '#fff'; ctx.font = 'bold 48px sans-serif';
+    ctx.fillText('操作説明', W/2, 70);
+    const rows = [
+      ['左スティック', '移動・方向入力（攻撃の向き）', 'PC: ←→ / W↑ S↓'],
+      ['X ボタン', 'ジャンプ（最大3〜4段／キャラ依存）', 'PC: K'],
+      ['Y ボタン', '攻撃（素手3段／武器攻撃。方向で技変化）', 'PC: J'],
+      ['A ボタン', 'アイテムボックス開く→武器を装備', 'PC: L'],
+      ['🛡 B ボタン', 'シールド（長押しでガード）', 'PC: B'],
+      ['SP ボタン', 'スペシャル：速度2倍10秒／CD20秒', 'PC: Space / Shift'],
+    ];
+    ctx.textAlign = 'left'; const x0 = W/2 - 440;
+    rows.forEach((r, i) => {
+      const y = 150 + i * 66;
+      ctx.fillStyle = '#1d2840'; roundRect(ctx, x0, y - 30, 880, 56, 10); ctx.fill();
+      ctx.fillStyle = '#ffd166'; ctx.font = 'bold 24px sans-serif'; ctx.fillText(r[0], x0 + 20, y + 6);
+      ctx.fillStyle = '#fff'; ctx.font = '20px sans-serif'; ctx.fillText(r[1], x0 + 230, y + 6);
+      ctx.fillStyle = '#7e8db0'; ctx.font = '16px sans-serif'; ctx.textAlign = 'right'; ctx.fillText(r[2], x0 + 860, y + 6); ctx.textAlign = 'left';
+    });
+    // シールドの補足
+    ctx.fillStyle = '#9fb3d1'; ctx.font = '17px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('シールドは攻撃を受けると削れ、割れると約2秒間動けなくなる（ガードブレイク）。使わなければ自然回復。', W/2, 150 + rows.length * 66 + 16);
+    this.btn(W/2 - 110, H - 90, 220, 60, '← 戻る', () => { this.scene = 'title'; }, { font:26 });
+  },
+
+  startVersus() {
+    // Firebase が設定済みなら部屋UIへ、未設定ならローカルCPU対戦
+    if (window.Net && window.Net.available()) {
+      this.scene = 'room';  // net.js が描画を担う（簡易）
+      window.Net.openRoomUI(this);
+    } else {
+      this.mode = 'versus'; this.scene = 'charselect'; this.resetSelect();
+    }
+  },
+
+  resetSelect() {
+    this.sel = { charIdx:0, colorIdx:0, botChar:2, botMode:'cpu', stageIdx:0, confirmed:false };
+  },
+
+  /* ---------- キャラ選択（設計書 3.2 / 17.3） ---------- */
+  sceneCharSelect() {
+    const ctx = this.ctx; bgGradient(ctx);
+    ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.font = 'bold 44px sans-serif';
+    ctx.fillText('キャラクター選択', W/2, 70);
+
+    // キャラ一覧：1段に最大8体、9体目から折り返し。段数に応じてカードを縮小し、下のUIはグリッド下端に追従
+    const n = CHAR_ORDER.length, gap = 14, perRow = 8;
+    const cw = Math.min(150, Math.floor((W - 80 - (perRow - 1) * gap) / perRow));
+    const rows = Math.ceil(n / perRow);
+    const ch = rows >= 3 ? 110 : 150, rowGap = rows >= 3 ? 10 : 14, gridTop = 88;
+    const gridBottom = gridTop + rows * (ch + rowGap) - rowGap;   // カード群の下端
+    const pscale = ch >= 150 ? 1 : 0.75;                          // 小カードはプレビュー縮小
+    CHAR_ORDER.forEach((cid, i) => {
+      const c = CHARS[cid];
+      const row = Math.floor(i / perRow), col = i % perRow;
+      const inRow = Math.min(perRow, n - row * perRow);          // この段のカード数
+      const rowTotal = inRow * cw + (inRow - 1) * gap;
+      const x = (W - rowTotal) / 2 + col * (cw + gap);           // 段ごとに中央寄せ
+      const y = gridTop + row * (ch + rowGap);
+      const selected = this.sel.charIdx === i;
+      ctx.fillStyle = selected ? '#2c3e63' : '#1d2840';
+      roundRect(ctx, x, y, cw, ch, 12); ctx.fill();
+      ctx.strokeStyle = selected ? '#ffd166' : '#3a4a6a'; ctx.lineWidth = selected ? 4 : 2; ctx.stroke();
+      // プレビュー棒人間（足元をカード下寄りに）
+      ctx.save(); ctx.translate(x + cw/2, y + ch - 20); ctx.scale(pscale, pscale);
+      drawPreviewFighter(ctx, 0, 0, cid, COLORS[this.sel.colorIdx].std);
+      ctx.restore();
+      // 名前：カード幅に収まるようフォントを自動縮小
+      ctx.fillStyle = '#fff'; ctx.textAlign = 'center';
+      let nameFont = 22; ctx.font = 'bold ' + nameFont + 'px sans-serif';
+      while (ctx.measureText(c.name).width > cw - 12 && nameFont > 10) { nameFont--; ctx.font = 'bold ' + nameFont + 'px sans-serif'; }
+      ctx.fillText(c.name, x + cw/2, y + 24);
+      ctx.fillStyle = '#9fb3d1'; ctx.font = '12px sans-serif';
+      ctx.fillText('特性:' + c.trait, x + cw/2, y + ch - 8);
+      this.btn(x, y, cw, ch, '', () => { this.sel.charIdx = i; Sound.play('se_ui_select'); }, { bare:true });
+    });
+
+    // 選択中キャラの説明（カードの下に追従表示）
+    const selDef = CHARS[CHAR_ORDER[this.sel.charIdx]];
+    if (selDef && selDef.desc) {
+      ctx.fillStyle = '#9fb3d1'; ctx.font = '18px sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText('▶ ' + selDef.name + '：' + selDef.desc, W/2, gridBottom + 24);
+    }
+
+    // カラーパレット（グリッド下端に追従）
+    ctx.fillStyle = '#fff'; ctx.font = '20px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('カラー選択', W/2, gridBottom + 48);
+    const sw = 46, sg = 12, tw = COLORS.length * sw + (COLORS.length - 1) * sg;
+    let cx = (W - tw) / 2;
+    const palY = gridBottom + 60;
+    COLORS.forEach((col, i) => {
+      const x = cx + i * (sw + sg);
+      ctx.fillStyle = col.std; roundRect(ctx, x, palY, sw, sw, 8); ctx.fill();
+      if (this.sel.colorIdx === i) { ctx.strokeStyle = '#fff'; ctx.lineWidth = 4; ctx.stroke(); }
+      this.btn(x, palY, sw, sw, '', () => { this.sel.colorIdx = i; Sound.play('se_ui_select'); }, { bare:true });
+    });
+
+    // トレーニング時：ボットの設定
+    const botY = palY + sw + 22;
+    if (this.mode === 'training') {
+      ctx.fillStyle = '#fff'; ctx.font = '20px sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText('ボット設定', W/2, botY);
+      this.btn(W/2 - 250, botY + 10, 230, 44, 'ボット:静止', () => { this.sel.botMode = 'static'; }, { sel: this.sel.botMode === 'static' });
+      this.btn(W/2 + 20, botY + 10, 230, 44, 'ボット:CPU', () => { this.sel.botMode = 'cpu'; }, { sel: this.sel.botMode === 'cpu' });
+    } else {
+      ctx.fillStyle = '#9fb3d1'; ctx.font = '18px sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText('対戦: あなた + CPU3体（オンライン未設定のためローカル対戦）', W/2, botY + 10);
+    }
+
+    // 決定（→ ステージ選択へ）
+    this.btn(W/2 - 130, botY + 64, 260, 60, '決定', () => { this.scene = 'stageselect'; }, { color:'#2e8b57', font:30 });
+    this.btn(40, 30, 130, 50, '← 戻る', () => { this.scene = 'title'; }, { font:22 });
+  },
+
+  /* ---------- ステージ選択（キャラ選択の後／ホストのみ操作可） ---------- */
+  sceneStageSelect() {
+    const ctx = this.ctx; bgGradient(ctx);
+    ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.font = 'bold 44px sans-serif';
+    ctx.fillText('ステージ選択', W/2, 72);
+
+    const n = STAGES.length, gap = 30, cw = 360, ch = 230;
+    const total = n * cw + (n - 1) * gap;
+    let sx = (W - total) / 2;
+    STAGES.forEach((s, i) => {
+      const x = sx + i * (cw + gap), y = 130;
+      const selected = this.sel.stageIdx === i;
+      // ステージのミニプレビュー（実描画を縮小してカード内にクリップ）
+      ctx.save();
+      roundRect(ctx, x, y, cw, ch, 12); ctx.clip();
+      ctx.translate(x, y); ctx.scale(cw / W, ch / H);
+      drawStage(ctx, s);
+      ctx.restore();
+      // 枠
+      ctx.strokeStyle = selected ? '#ffd166' : '#3a4a6a'; ctx.lineWidth = selected ? 5 : 2;
+      roundRect(ctx, x, y, cw, ch, 12); ctx.stroke();
+      // 名前ラベル
+      ctx.fillStyle = 'rgba(0,0,0,0.55)'; roundRect(ctx, x, y + ch - 42, cw, 42, 8); ctx.fill();
+      ctx.fillStyle = selected ? '#ffd166' : '#fff'; ctx.font = 'bold 24px sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText(s.name, x + cw/2, y + ch - 13);
+      this.btn(x, y, cw, ch, '', () => { this.sel.stageIdx = i; Sound.play('se_ui_select'); }, { bare:true });
+    });
+
+    ctx.fillStyle = '#9fb3d1'; ctx.font = '18px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('ローカル対戦・トレーニングではホスト（あなた）がステージを選びます', W/2, 410);
+
+    this.btn(W/2 - 130, 470, 260, 64, '対戦スタート', () => this.startMatch(), { color:'#2e8b57', font:28 });
+    this.btn(40, 30, 150, 50, '← キャラ選択', () => { this.scene = 'charselect'; }, { font:20 });
+  },
+
+  startMatch() {
+    applyStage(this.sel.stageIdx);          // 選んだステージを適用（ローカル/トレーニング）
+    const charId = CHAR_ORDER[this.sel.charIdx];
+    const fighters = [];
+    const human = new Fighter(charId, this.sel.colorIdx, { human:true, label:'P1' });
+    human.controller = HumanController;
+    fighters.push(human);
+
+    if (this.mode === 'training') {
+      const bot = new Fighter(CHAR_ORDER[this.sel.botChar], 1, { bot:true, botMode:this.sel.botMode, label:'BOT' });
+      bot.controller = new CPUController(this.sel.botMode);
+      fighters.push(bot);
+    } else {
+      const used = new Set([this.sel.colorIdx]);
+      for (let i = 1; i < this.versusPlayers; i++) {
+        let ci; do { ci = Math.floor(Math.random()*8); } while (used.has(ci) && used.size < 8); used.add(ci);
+        const bc = CHAR_ORDER[(this.sel.charIdx + i) % CHAR_ORDER.length];
+        const bot = new Fighter(bc, ci, { bot:true, botMode:'cpu', label:'CPU'+i });
+        bot.controller = new CPUController('cpu');
+        fighters.push(bot);
+      }
+    }
+    this.world = new World(fighters, { training: this.mode === 'training' });
+    this.drawMode = null; this._stroke = null;
+    this.countdown = 0; this.countNum = 3;
+    this.scene = 'countdown';
+  },
+
+  /* ========== ネット対戦（ホスト権限同期） ========== */
+  // net.js が state==='playing' を検知したら match 情報とともに呼ぶ
+  startNetMatch(match, myId, isHost, stageIdx) {
+    applyStage(stageIdx || 0);                      // ホストが選んだステージを全員に適用
+    const order = Object.values(match);            // [{pid,char,color}] 全クライアント共通順
+    const fighters = [];
+    this.netControllers = {};                      // pid -> RemoteController（ホスト用）
+    order.forEach((m, i) => {
+      const isSelf = m.pid === myId;
+      const f = new Fighter(m.char, m.color, { human: isSelf, label: 'P' + (i + 1) });
+      f.pid = m.pid;
+      if (isHost) {
+        if (isSelf) { f.controller = HumanController; }
+        else { const rc = new RemoteController(); this.netControllers[m.pid] = rc; f.controller = rc; }
+      } else {
+        // クライアントはシミュレーションしない（スナップショット描画）。controllerは未使用
+        f.controller = { poll(){}, dirX(){return 0;}, dir(){return 'none';}, held:{}, edge:{} };
+        f.netMode = true;
+      }
+      fighters.push(f);
+    });
+    this.world = new World(fighters, { net: true });
+    this.world.netRole = isHost ? 'host' : 'client';
+    this.world.myIndex = order.findIndex(m => m.pid === myId);
+
+    this._netPubTick = 0; this._netInFrame = 0; this._lastInput = '';
+    this._netSnap = null; this._ic = { X:0, Y:0, A:0, B:0, SP:0 };
+
+    if (isHost) {
+      Net.clearMatchData();                        // 古い入力/スナップショットを掃除
+      Net.onInputs((mapOfInputs) => {
+        for (const pid in this.netControllers) {
+          if (mapOfInputs && mapOfInputs[pid]) this.netControllers[pid].setData(mapOfInputs[pid]);
+        }
+      });
+    } else {
+      Net.onSnapshot((snap) => { this._netSnap = snap; });
+    }
+    this.mode = 'versus';
+    this.drawMode = null; this._stroke = null;
+    this.countdown = 0; this.countNum = 3; this._lastPhase = -1;
+    this.scene = 'countdown';
+  },
+
+  // ホスト：全fighterの状態を圧縮してRTDBへ
+  encodeSnapshot(world) {
+    return {
+      t: Date.now(),
+      o: world.over ? 1 : 0,
+      w: world.winner ? world.fighters.indexOf(world.winner) : -1,
+      f: world.fighters.map(f => ({
+        x: Math.round(f.x), y: Math.round(f.y), vx: Math.round(f.vx * 10) / 10,
+        fa: f.facing, s: f.state, w: f.weapon, d: Math.round(f.damage), k: f.stocks,
+        spa: Math.round(f.spActive), spcd: Math.round(f.spCooldown), b: f.boxOpen ? 1 : 0, bs: f.boxSel || 0,
+        iv: f.invuln > 0 ? 1 : 0, rt: f.respawnTimer > 0 ? 1 : 0, dd: f.dead ? 1 : 0,
+        sh: f.shielding ? 1 : 0, shv: Math.round(f.shield), gb: f.guardBreak > 0 ? 1 : 0,
+        mf: f.mathFrozen ? 1 : 0, ms: f.mathSelecting ? 1 : 0, mwf: f.mathWrongFlash > 0 ? 1 : 0,
+        mq: (f.mathFrozen && f.mathProblem) ? f.mathProblem.text : '',
+        mc: (f.mathFrozen && f.mathProblem) ? f.mathProblem.choices : null,
+        mti: f.mathTargetIdx || 0,
+        tstop: f.timeStopped > 0 ? 1 : 0, slw: f.slowed > 0 ? 1 : 0, scd: Math.round(f.specialCD()),
+        drw: f.drawing ? 1 : 0,
+        spw: Math.round(f.superPower),
+        rev: f.reversed > 0 ? 1 : 0,
+        jb: f.jumpBlocked > 0 ? 1 : 0,
+        db: f.dashBoost > 0 ? 1 : 0,
+        sm: f.shatterMode > 0 ? 1 : 0,
+        ivc: f.invincible > 0 ? 1 : 0,
+        slip: f.slipped > 0 ? 1 : 0,
+        bcd: Math.round(f.bombCooldown),
+        chg: f.charging ? 1 : 0,
+      })),
+      p: world.projectiles.map(pr => ({ x: Math.round(pr.x), y: Math.round(pr.y) })),
+      dood: world.doodles.length ? world.doodles.map(d => ({
+        x: Math.round(d.x), y: Math.round(d.y), a: Math.round(d.angle * 100),
+        p: d.pts.map(pt => [Math.round(pt.x), Math.round(pt.y)]),
+      })) : undefined,
+      ban: world.bananas.length ? world.bananas.map(b => ({ x: Math.round(b.x), y: Math.round(b.y) })) : undefined,
+      bmb: world.bombs.length ? world.bombs.map(b => ({ x: Math.round(b.x), y: Math.round(b.y), f: b.fuse })) : undefined,
+      se: (this._seEvents && this._seEvents.length) ? this._seEvents : undefined,
+    };
+  },
+
+  // クライアント：受信スナップショットをfighterへ反映（予測なし）
+  applyNetSnapshot(world, snap) {
+    const F = snap.f || [];
+    const myI = (world.netRole === 'client') ? world.myIndex : -1;
+    for (let i = 0; i < world.fighters.length && i < F.length; i++) {
+      const f = world.fighters[i], s = F[i];
+      if (s.d > f.damage) spawnHitSpark(f.x, f.y - 40);   // 被弾でスパーク
+      // ステータス系（常にホスト権威）
+      f.state = s.s; f.weapon = s.w; f.damage = s.d; f.stocks = s.k;
+      f.spActive = s.spa || 0; f.spCooldown = s.spcd || 0; f.boxOpen = !!s.b; f.boxSel = s.bs || 0;
+      f.invuln = s.iv ? 1 : 0; f.respawnTimer = s.rt ? 1 : 0; f.dead = !!s.dd;
+      f.shielding = !!s.sh; f.shield = (s.shv != null ? s.shv : f.shieldMax()); f.guardBreak = s.gb ? 1 : 0;
+      f.mathFrozen = !!s.mf; f.mathSelecting = !!s.ms; f.mathWrongFlash = s.mwf ? 1 : 0;
+      f.mathTargetIdx = s.mti || 0;
+      f.timeStopped = s.tstop ? 1 : 0;
+      f.slowed = s.slw ? 1 : 0;
+      f.drawing = !!s.drw;
+      f.superPower = s.spw || 0;
+      f.reversed = s.rev ? 1 : 0;
+      f.jumpBlocked = s.jb ? 1 : 0;
+      f.dashBoost = s.db ? 1 : 0;
+      f.shatterMode = s.sm ? 1 : 0;
+      f.invincible = s.ivc ? 1 : 0;
+      f.slipped = s.slip ? 1 : 0;
+      f.bombCooldown = s.bcd || 0;
+      f.charging = !!s.chg;
+      // 固有スキルのクールタイムを該当フィールドへ（ボタン表示用）
+      const _cd = s.scd || 0;
+      if (f.def.id === 'chara_time') f.timeCooldown = _cd;
+      else if (f.def.id === 'chara_slow') f.slowCooldown = _cd;
+      else if (f.def.id === 'chara_math') f.mathCooldown = _cd;
+      else if (f.def.id === 'chara_superpower') f.superCooldown = _cd;
+      else if (f.def.id === 'chara_reverse') f.reverseCooldown = _cd;
+      else if (f.def.id === 'chara_nojumper') f.noJumpCooldown = _cd;
+      else if (f.def.id === 'chara_yosen') f.dashCooldown = _cd;
+      else if (f.def.id === 'chara_hpop') f.shatterCooldown = _cd;
+      else if (f.def.id === 'chara_yuton') f.invincCooldown = _cd;
+      else if (f.def.id === 'chara_banana') f.bananaCooldown = _cd;
+      f.mathProblem = (s.mf && s.mq) ? { text: s.mq, choices: s.mc || [], answer: null } : (f.mathFrozen ? f.mathProblem : null);
+      f.facing = s.fa; f.vx = s.vx;
+      if (i === myI) {
+        // 自キャラ：補間なしで即時反映（受信した瞬間にそのまま描画＝最小遅延）
+        f.x = s.x; f.y = s.y;
+      } else {
+        // 相手キャラ：軽い補間でなめらかに
+        if (f._tx === undefined) { f.x = s.x; f.y = s.y; }
+        f.x = lerp(f.x, s.x, 0.5); f.y = lerp(f.y, s.y, 0.5);
+      }
+      f._tx = s.x; f._ty = s.y;
+    }
+    world.netProjectiles = snap.p || [];
+    world.netDoodles = snap.dood || [];
+    world.netBananas = snap.ban || [];
+    world.netBombs = snap.bmb || [];
+    world.over = !!snap.o;
+    world.winner = (snap.w >= 0 && snap.w < world.fighters.length) ? world.fighters[snap.w] : null;
+    // ホストで鳴ったSEをクライアントでも再生（対戦時の音を安定化）
+    if (snap.se) for (const ev of snap.se) Sound.playRemote(ev[0], ev[1] || 0);
+  },
+  // クライアントで自キャラをローカル予測してよいか（自由状態のみ）
+  canPredict(f) {
+    if (!f || !f._hostFree || f.charging) return false;   // スマッシュ溜め中は足を止めるので予測しない
+    const st = f._hostState || f.state;
+    return st === 'idle' || st === 'run' || st === 'jump_up' || st === 'jump_air';
+  },
+
+  // クライアント：自分の入力をRTDBへ（変化時 or 一定間隔）
+  sendNetInput() {
+    const e = Input.edge;
+    if (e.X) this._ic.X++; if (e.Y) this._ic.Y++; if (e.A) this._ic.A++;
+    if (e.B) this._ic.B++; if (e.SP) this._ic.SP++;
+    const h = Input.held;
+    const payload = {
+      l: h.left ? 1 : 0, r: h.right ? 1 : 0, u: h.up ? 1 : 0, d: h.down ? 1 : 0,
+      ax: Math.round(Input.moveX() * 10) * 10,  // アナログ横入力（0.1刻み＝送信スパム抑制）
+      sb: h.B ? 1 : 0,                         // シールド（B長押し）の保持状態
+      sy: h.Y ? 1 : 0,                         // 攻撃Yの保持状態（スマッシュ溜め検出用）
+      cX: this._ic.X, cY: this._ic.Y, cA: this._ic.A, cSP: this._ic.SP,
+    };
+    if (this._boxPick) { payload.bs = this._boxPick.v; payload.bsSeq = this._boxPick.seq; }
+    if (this._mathAns) { payload.ma = this._mathAns.v; payload.maSeq = this._mathAns.seq; }
+    if (this._mathTgt) { payload.mt = this._mathTgt.v; payload.mtSeq = this._mathTgt.seq; }
+    if (this._drawSend) { payload.dr = this._drawSend.pts.map(p => [Math.round(p.x), Math.round(p.y)]); payload.drSeq = this._drawSend.seq; }
+    if (this._endDraw) { payload.edSeq = this._endDraw.seq; }
+    const s = JSON.stringify(payload);
+    this._netInFrame = (this._netInFrame || 0) + 1;
+    if (s !== this._lastInput || this._netInFrame % 2 === 0) { this._lastInput = s; Net.writeInput(payload); }
+    this._drawSend = null; this._endDraw = null;   // 大きなストロークは1回送ったら破棄
+  },
+
+  // アイテム/算数のUI操作（ローカルは即実行、ネットクライアントは入力で送信）
+  pickBox(f, i) {
+    const opt = f.boxOptions()[i];
+    if (this.world && this.world.netRole === 'client') {
+      this._boxPick = { v: i, seq: (this._boxPickSeq = (this._boxPickSeq || 0) + 1) };
+      if (opt && opt.type === 'draw') this.drawMode = f;   // クライアントでも描画UIを開く
+    } else { f.boxSel = i; f.applyBoxSelection(this.world); }
+  },
+  answerMath(f, value) {
+    if (this.world && this.world.netRole === 'client') { this._mathAns = { v: value, seq: (this._mathAnsSeq = (this._mathAnsSeq || 0) + 1) }; }
+    else { f.submitMathAnswer(value); }
+  },
+  chooseMathTarget(f, opp, idx) {
+    if (this.world && this.world.netRole === 'client') { this._mathTgt = { v: idx, seq: (this._mathTgtSeq = (this._mathTgtSeq || 0) + 1) }; }
+    else { f.confirmMathTarget(opp[idx]); }
+  },
+
+  leaveNet() {
+    if (window.Net && Net.leave) Net.leave();
+    if (this.world) { this.world.netRole = null; }
+    this.resultTimer = 0; this.scene = 'title';
+  },
+
+  /* ---------- カウントダウン（設計書 12） ---------- */
+  sceneCountdown() {
+    this.sceneBattle(true);              // 背景＆キャラを描画（停止）
+    const ctx = this.ctx;
+    this.countdown++;
+    const phase = Math.floor(this.countdown / 50);
+    if (phase !== this._lastPhase) {
+      this._lastPhase = phase;
+      if (phase < 3) Sound.play('se_countdown');
+      else if (phase === 3) Sound.play('se_gong');
+    }
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    const local = this.countdown % 50, scl = 1 + (1 - local/50) * 1.5;
+    let txt = '';
+    if (phase === 0) txt = '3'; else if (phase === 1) txt = '2'; else if (phase === 2) txt = '1';
+    else if (phase === 3) txt = 'start‼';
+    ctx.save(); ctx.translate(W/2, H/2 - 60);
+    if (phase < 3) ctx.scale(scl, scl);
+    ctx.fillStyle = phase === 3 ? '#ffd166' : '#fff';
+    ctx.shadowColor = '#000'; ctx.shadowBlur = 12;
+    ctx.font = 'bold ' + (phase === 3 ? 90 : 160) + 'px sans-serif';
+    ctx.fillText(txt, 0, 0); ctx.restore();
+    ctx.shadowBlur = 0;
+    if (phase >= 4) { this.scene = 'battle'; this._lastPhase = -1; }
+  },
+
+  /* ---------- 対戦（設計書 12/13） ---------- */
+  sceneBattle(frozen) {
+    const ctx = this.ctx;
+    const world = this.world;
+    drawStage(ctx);
+
+    const role = world.netRole;     // 'host' | 'client' | undefined（ローカル）
+    if (!frozen && world && !world.over) {
+      if (role === 'host') {
+        Sound.beginCapture();
+        world.update();
+        this._seEvents = Sound.endCapture();             // このフレームに鳴ったSEを配信に乗せる
+        Net.writeSnapshot(this.encodeSnapshot(world));   // 毎フレーム配信（最小遅延・予測なし）
+      } else if (role === 'client') {
+        this.sendNetInput();                                   // 自分の入力を送信（変化時は即送信）
+        if (this._netSnap) this.applyNetSnapshot(world, this._netSnap);
+        for (const f of world.fighters) { f.netMode = true; if (f.timeStopped <= 0) f.updateAnim(null); }  // 停止中はアニメも止める
+        updateSparks();
+      } else {
+        world.update();
+      }
+    }
+
+    // 描画（投射物：クライアントは受信座標、それ以外はローカル）
+    if (role === 'client') {
+      ctx.fillStyle = '#ffe066';
+      for (const pr of (world.netProjectiles || [])) { ctx.beginPath(); ctx.arc(pr.x, pr.y, 5, 0, Math.PI*2); ctx.fill(); }
+    } else {
+      for (const p of world.projectiles) p.draw(ctx);
+    }
+    // Q2の白線（落書き）
+    if (role === 'client') {
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 4; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      for (const d of (world.netDoodles || [])) {
+        ctx.save(); ctx.translate(d.x, d.y); ctx.rotate((d.a || 0) / 100);
+        ctx.beginPath(); (d.p || []).forEach((pt, i) => i ? ctx.lineTo(pt[0], pt[1]) : ctx.moveTo(pt[0], pt[1])); ctx.stroke();
+        ctx.restore();
+      }
+    } else {
+      for (const d of world.doodles) d.draw(ctx);
+    }
+    for (const ba of (role === 'client' ? (world.netBananas || []) : world.bananas)) drawGroundBanana(ctx, ba);
+    for (const bo of (role === 'client' ? (world.netBombs || []) : world.bombs)) drawBomb(ctx, bo);
+    for (const f of world.fighters) if (!f.dead && f.respawnTimer <= 0) drawCharacter(ctx, f);
+    drawSparks(ctx);
+    // 時間停止の演出：開始時に画面フラッシュ（ホスト/クライアント共通で検出）
+    const anyStop = world.fighters.some(f => f.timeStopped > 0 && !f.dead);
+    if (anyStop && !this._wasStop) world.timeStopFlash = 30;
+    this._wasStop = anyStop;
+    if (world.timeStopFlash > 0) {
+      ctx.fillStyle = 'rgba(120,200,255,' + (world.timeStopFlash / 30 * 0.45) + ')';
+      ctx.fillRect(0, 0, W, H);
+      if (world.timeStopFlash > 18) { ctx.fillStyle = '#bfe6ff'; ctx.font = 'bold 70px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('TIME STOP', W/2, H/2 - 80); }
+      world.timeStopFlash--;
+    }
+    drawHUD(ctx, world);
+    // 仮想コントローラ（自分のキャラに対して）。お絵かき中はコントローラを隠して描画UIに
+    const localF = (world.myIndex != null) ? world.fighters[world.myIndex] : world.fighters[0];
+    if (this.drawMode && (this.drawMode.dead || this.drawMode.respawnTimer > 0)) this.exitDrawMode();  // 描画中にKOされたら解除
+    if (this.drawMode && !this.drawMode.drawing) this.exitDrawMode();  // ホストが予算切れでdrawing解除したらクライアントも追従
+    if (this.drawMode) this.drawDrawingUI(ctx);
+    else drawVirtualController(ctx, localF);
+    drawMathUI(ctx, world, localF);
+
+    if (role && !this.drawMode) {
+      this.btn(W - 110, 16, 94, 44, '退出', () => { this.leaveNet(); }, { font:18 });
+    }
+
+    // トレーニング用ボタン
+    if (this.world.training) {
+      this.btn(W - 360, 16, 160, 44, 'ダメージリセット', () => { for (const f of this.world.fighters) f.damage = 0; }, { font:18 });
+      this.btn(W - 190, 16, 80, 44, 'BOT切替', () => {
+        const b = this.world.fighters[1];
+        const nm = b.controller.mode === 'cpu' ? 'static' : 'cpu';
+        b.controller.mode = nm;
+      }, { font:16 });
+      this.btn(W - 100, 16, 84, 44, 'タイトル', () => { this.scene = 'title'; }, { font:16 });
+    }
+
+    if (this.world.over) {
+      this.resultTimer = (this.resultTimer || 0) + 1;
+      const w = this.world.winner;
+      ctx.textAlign = 'center'; ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fillRect(0,0,W,H);
+      ctx.fillStyle = '#ffd166'; ctx.font = 'bold 80px sans-serif';
+      ctx.fillText((w ? w.label + ' (' + w.def.name + ')' : '') + ' WIN！', W/2, H/2 - 20);
+      if (this.resultTimer > 120) { this.scene = 'result'; }
+    }
+  },
+
+  /* ---------- リザルト（設計書 12） ---------- */
+  sceneResult() {
+    const ctx = this.ctx; bgGradient(ctx);
+    ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.font = 'bold 60px sans-serif';
+    ctx.fillText('リザルト', W/2, 110);
+    // 順位：生存→脱落、各群はストック降順（ネット時は placements が無くても成立）
+    const order = this.world.fighters.filter(f => !f.isClone).sort((a, b) => {
+      if (a.dead !== b.dead) return a.dead ? 1 : -1;
+      if (b.stocks !== a.stocks) return b.stocks - a.stocks;
+      return a.damage - b.damage;
+    });
+    order.forEach((f, i) => {
+      const y = 200 + i * 80;
+      ctx.fillStyle = i === 0 ? '#ffd166' : '#26324d';
+      roundRect(ctx, W/2 - 320, y - 32, 640, 64, 10); ctx.fill();
+      ctx.fillStyle = i === 0 ? '#1a1a1a' : '#fff'; ctx.textAlign = 'left'; ctx.font = 'bold 30px sans-serif';
+      ctx.fillText((i+1) + '位', W/2 - 290, y + 8);
+      ctx.fillText(f.label + '  /  ' + f.def.name, W/2 - 180, y + 8);
+      ctx.textAlign = 'right';
+      ctx.fillText('残ストック ' + f.stocks, W/2 + 290, y + 8);
+    });
+    // ハンデで優勝したときだけの煽りコメント
+    const champ = order[0];
+    if (champ && champ.isHuman && champ.def.id === 'chara_hande') {
+      ctx.fillStyle = '#ffd166'; ctx.textAlign = 'center'; ctx.font = 'bold 34px sans-serif';
+      ctx.fillText('ハンデつけても勝っちゃうよん', W/2, 540);
+    }
+    if (this.world.netRole) {
+      // ネット対戦：キャラ選択(ロビー)へ戻る / 退出
+      const hint = (window.Net && Net.isHost) ? 'キャラ選択へ戻る' : 'キャラ選択へ（ホスト待ち）';
+      this.btn(W/2 - 270, 580, 270, 70, hint, () => { this.resultTimer = 0; if (window.Net && Net.returnToLobby) Net.returnToLobby(); }, { color:'#2e8b57', font:24 });
+      this.btn(W/2 + 20, 580, 250, 70, '退出してタイトルへ', () => { this.leaveNet(); }, { font:22 });
+    } else {
+      // ローカル対戦：もう一度 / キャラ選択へ / タイトルへ
+      this.btn(W/2 - 345, 580, 220, 70, 'もう一度', () => { this.resultTimer = 0; this.startMatch(); }, { color:'#2e8b57', font:26 });
+      this.btn(W/2 - 110, 580, 220, 70, 'キャラ選択へ', () => { this.resultTimer = 0; this.scene = 'charselect'; }, { font:26 });
+      this.btn(W/2 + 125, 580, 220, 70, 'タイトルへ', () => { this.resultTimer = 0; this.scene = 'title'; }, { font:26 });
+    }
+  },
+};
+
+/* ======================= 13. 描画ヘルパー ======================= */
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function bgGradient(ctx) {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#1a2238'); g.addColorStop(1, '#0a0e1a');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+}
+function drawStage(ctx, stage) {
+  const st = stage || STAGE, th = st.theme;
+  // 背景：空＋シルエット（ステージごとにテーマ色）
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, th.sky[0]); g.addColorStop(0.6, th.sky[1]); g.addColorStop(1, th.sky[2]);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = th.bg;
+  for (let i = 0; i < 14; i++) { const bx = i * 95 + 10, bh = 80 + (i*53 % 160); ctx.fillRect(bx, H - bh, 70, bh); }
+  // メイン台
+  ctx.fillStyle = th.mainFill;
+  roundRect(ctx, st.main.x1, st.main.y, st.main.x2 - st.main.x1, 120, 6); ctx.fill();
+  ctx.fillStyle = th.mainTop; ctx.fillRect(st.main.x1, st.main.y, st.main.x2 - st.main.x1, 8);
+  // 中央台
+  ctx.fillStyle = th.centerFill;
+  roundRect(ctx, st.center.x1, st.center.y, st.center.x2 - st.center.x1, 16, 6); ctx.fill();
+  ctx.fillStyle = th.centerTop; ctx.fillRect(st.center.x1, st.center.y, st.center.x2 - st.center.x1, 4);
+}
+// HUD（設計書 13）
+function drawHUD(ctx, world) {
+  const players = world.fighters.filter(f => !f.isClone);   // 分身はHUDに出さない
+  const n = players.length, bw = 200, gap = 20;
+  const total = n * bw + (n - 1) * gap;
+  let sx = (W - total) / 2;
+  players.forEach((f, i) => {
+    const x = sx + i * (bw + gap), y = 14;
+    ctx.fillStyle = f.dead ? 'rgba(40,40,40,0.7)' : 'rgba(20,28,46,0.85)';
+    roundRect(ctx, x, y, bw, 78, 10); ctx.fill();
+    ctx.strokeStyle = f.color(); ctx.lineWidth = 3; ctx.stroke();
+    // 名前
+    ctx.fillStyle = '#fff'; ctx.textAlign = 'left'; ctx.font = 'bold 18px sans-serif';
+    ctx.fillText(f.label + ' ' + f.def.name, x + 12, y + 24);
+    // ダメージ%
+    ctx.textAlign = 'right';
+    const big = f.isHuman;
+    ctx.font = 'bold ' + (big ? 38 : 30) + 'px sans-serif';
+    ctx.fillStyle = f.dead ? '#888' : (f.damage >= 100 ? '#ff4d4d' : '#fff');  // 100%超で赤（設計書 13）
+    ctx.fillText(Math.floor(f.damage) + '%', x + bw - 12, y + 56);
+    // ストック（ハート・設計書 13）
+    ctx.textAlign = 'left'; ctx.font = '18px sans-serif';
+    let hearts = '';
+    for (let s = 0; s < 3; s++) hearts += s < f.stocks ? '♥' : '♡';
+    ctx.fillStyle = '#ff6b81'; ctx.fillText(hearts, x + 12, y + 56);
+    // 装備武器アイコン
+    if (f.weapon !== 'bare') { ctx.font = '20px sans-serif'; ctx.textAlign = 'right'; ctx.fillText(WEAPONS[f.weapon].icon, x + bw - 12, y + 24); }
+  });
+}
+
+/* ---- 仮想コントローラ描画（設計書 4） ---- */
+function drawVirtualController(ctx, human) {
+  ctx.globalAlpha = 0.85;
+  // 左スティック（+25%）
+  const sb = { cx: 165, cy: H - 150, r: 100 };
+  ctx.fillStyle = 'rgba(255,255,255,0.10)';
+  ctx.beginPath(); ctx.arc(sb.cx, sb.cy, sb.r, 0, Math.PI*2); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.3)'; ctx.lineWidth = 3; ctx.stroke();
+  let tx = sb.cx, ty = sb.cy;
+  if (Input.stick.active) {
+    const m = Math.min(Math.hypot(Input.stick.dx, Input.stick.dy), sb.r);
+    const a = Math.atan2(Input.stick.dy, Input.stick.dx);
+    tx = sb.cx + Math.cos(a) * m; ty = sb.cy + Math.sin(a) * m;
+  }
+  ctx.fillStyle = 'rgba(255,255,255,0.35)'; ctx.beginPath(); ctx.arc(tx, ty, 45, 0, Math.PI*2); ctx.fill();
+
+  // 右側ボタン群 + SP（設計書 4 の配置・各ボタン+25%）
+  const defs = [
+    { name:'SP', x: W/2 - 40,  y: H - 95,  r: 58, label:'SP', color:'rgba(255,140,40,0.4)' },
+    { name:'X',  x: W - 215,  y: H - 215, r: 53, label:'X' },
+    { name:'Y',  x: W - 300,  y: H - 125, r: 53, label:'Y' },
+    { name:'A',  x: W - 130,  y: H - 125, r: 53, label:'A' },
+    { name:'B',  x: W - 215,  y: H - 62,  r: 53, label:'🛡' },
+  ];
+  Input.btnRects = {};
+  for (const d of defs) {
+    Input.btnRects[d.name] = { x: d.x - d.r, y: d.y - d.r, w: d.r*2, h: d.r*2 };
+    const pressed = Input.held[d.name];
+    ctx.fillStyle = pressed ? 'rgba(255,209,102,0.6)' : (d.color || 'rgba(255,255,255,0.15)');
+    ctx.beginPath(); ctx.arc(d.x, d.y, d.r, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.4)'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.font = 'bold ' + (d.name === 'B' ? 30 : 26) + 'px sans-serif';
+    ctx.fillText(d.label, d.x, d.y);
+    // SPクールタイム円弧（設計書 8）
+    if (d.name === 'SP' && human) {
+      if (human.spCooldown > 0) {
+        const p = 1 - human.spCooldown / 1200;
+        ctx.strokeStyle = '#ffd166'; ctx.lineWidth = 5;
+        ctx.beginPath(); ctx.arc(d.x, d.y, d.r + 6, -Math.PI/2, -Math.PI/2 + p * Math.PI*2); ctx.stroke();
+      } else if (human.spActive > 0) {
+        ctx.strokeStyle = '#4dff88'; ctx.lineWidth = 5;
+        ctx.beginPath(); ctx.arc(d.x, d.y, d.r + 6, 0, Math.PI*2); ctx.stroke();
+      }
+    }
+    // Bボタン：シールド耐久ゲージ
+    if (d.name === 'B' && human) {
+      ctx.lineWidth = 5;
+      if (human.guardBreak > 0) {
+        ctx.strokeStyle = '#ff4d4d';
+        ctx.beginPath(); ctx.arc(d.x, d.y, d.r + 6, 0, Math.PI*2); ctx.stroke();   // 割れ＝赤満
+      } else {
+        const sr = Math.max(0, Math.min(1, human.shield / human.shieldMax()));
+        ctx.strokeStyle = `hsl(${120 * sr},90%,60%)`;
+        ctx.beginPath(); ctx.arc(d.x, d.y, d.r + 6, -Math.PI/2, -Math.PI/2 + sr * Math.PI*2); ctx.stroke();
+      }
+    }
+    // Aボタン：固有スキル（時間停止/スロー/算数）のクールタイム表示
+    if (d.name === 'A' && human && human.specialCDMax() > 0) {
+      const cd = human.specialCD(), max = human.specialCDMax();
+      if (cd > 0) {
+        const p = 1 - cd / max;
+        ctx.strokeStyle = '#ff9f40'; ctx.lineWidth = 5;
+        ctx.beginPath(); ctx.arc(d.x, d.y, d.r + 6, -Math.PI/2, -Math.PI/2 + p * Math.PI*2); ctx.stroke();
+        ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.beginPath(); ctx.arc(d.x, d.y, d.r, 0, Math.PI*2); ctx.fill();  // 暗転＝使用不可
+        ctx.fillStyle = '#ffd166'; ctx.font = 'bold 26px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText(Math.ceil(cd / 60) + 's', d.x, d.y);   // 残り秒数
+      } else {
+        ctx.strokeStyle = '#4dff88'; ctx.lineWidth = 4;
+        ctx.beginPath(); ctx.arc(d.x, d.y, d.r + 6, 0, Math.PI*2); ctx.stroke();   // 準備OK＝緑リング
+      }
+    }
+  }
+  ctx.globalAlpha = 1;
+  ctx.textBaseline = 'alphabetic';
+
+  // アイテムボックスUI（開いている時・設計書 7）
+  if (human && human.boxOpen) drawItemBox(ctx, human);
+}
+function drawItemBox(ctx, f) {
+  const items = f.boxOptions();
+  const perRow = 3, rows = Math.ceil(items.length / perRow);
+  // 約30%拡大
+  const iw = 170, ih = 78, ig = 21, rowH = 94;
+  const bw = 936, bh = 140 + rows * rowH, bx = (W - bw)/2, by = 120;
+  ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#1d2840'; roundRect(ctx, bx, by, bw, bh, 16); ctx.fill();
+  ctx.strokeStyle = '#ffd166'; ctx.lineWidth = 3; ctx.stroke();
+  ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.font = 'bold 34px sans-serif';
+  ctx.fillText('アイテムボックス', W/2, by + 46);
+  items.forEach((it, i) => {
+    const col = i % perRow, row = Math.floor(i / perRow);
+    const x = W/2 - (perRow*iw + (perRow-1)*ig)/2 + col*(iw+ig);
+    const y = by + 74 + row*rowH;
+    const sel = f.boxSel === i;
+    const special = (it.type === 'math' || it.type === 'time' || it.type === 'slow');
+    const isBomb = (it.type === 'weapon' && it.weapon === 'bomb');
+    const cd = special ? f.specialCD() : (isBomb ? f.bombCooldown : 0);   // 残りクールタイム
+    const onCD = cd > 0;
+    ctx.fillStyle = special ? (sel ? '#7a5fae' : '#4a3a6a') : (sel ? '#3a6ea5' : '#26324d');
+    roundRect(ctx, x, y, iw, ih, 10); ctx.fill();
+    if (sel) { ctx.strokeStyle = '#ffd166'; ctx.lineWidth = 4; ctx.stroke(); }
+    ctx.fillStyle = '#fff'; ctx.font = '19px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(it.icon + ' ' + it.label, x + iw/2, y + ih/2 + (onCD ? -2 : 7));
+    if (onCD) {  // クールタイム中：暗転＋残り秒数＋下に進捗バー
+      ctx.fillStyle = 'rgba(0,0,0,0.55)'; roundRect(ctx, x, y, iw, ih, 10); ctx.fill();
+      ctx.fillStyle = '#ff9f40'; ctx.font = 'bold 22px sans-serif';
+      ctx.fillText('CT ' + Math.ceil(cd / 60) + 's', x + iw/2, y + ih/2 + 8);
+      const cmax = isBomb ? BOMB_CD : (f.specialCDMax() || 1);
+      ctx.fillStyle = '#ff9f40'; ctx.fillRect(x + 10, y + ih - 9, (iw - 20) * (1 - cd / cmax), 5);   // 残量バー
+    } else if (special || isBomb) {  // 準備OK
+      ctx.fillStyle = '#4dff88'; ctx.font = '13px sans-serif';
+      ctx.fillText('READY', x + iw/2, y + ih - 10);
+    }
+    // タッチ：セルを直接タップで選択＆実行
+    Game.btn(x, y, iw, ih, '', () => Game.pickBox(f, i), { bare:true });
+  });
+  ctx.fillStyle = '#9fb3d1'; ctx.font = '20px sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText('タップ または ←→で選択 / A=決定', W/2, by + bh - 18);
+}
+
+// 算数（mathキャラ）UI：問題表示／回答ボタン／対象選択（すべてタップ対応）
+function drawMathUI(ctx, world, localF) {
+  // 出題中のキャラ頭上に問題
+  for (const f of world.fighters) {
+    if (f.mathFrozen && f.mathProblem && !f.dead && f.respawnTimer <= 0) {
+      const tx = f.x, ty = f.y - 92, txt = f.mathProblem.text + ' = ?';
+      ctx.font = 'bold 22px sans-serif'; ctx.textAlign = 'center';
+      const w = ctx.measureText(txt).width + 28;
+      ctx.fillStyle = f.mathWrongFlash > 0 ? 'rgba(200,40,40,0.92)' : 'rgba(20,28,46,0.92)';
+      roundRect(ctx, tx - w/2, ty - 24, w, 36, 8); ctx.fill();
+      ctx.strokeStyle = '#ffd166'; ctx.lineWidth = 2; ctx.stroke();
+      ctx.fillStyle = '#fff'; ctx.fillText(txt, tx, ty);
+    }
+  }
+  if (!localF) return;
+  // 自分が出題されている（人間）→ 回答パネル
+  if (localF.mathFrozen && localF.mathProblem) {
+    const p = localF.mathProblem;
+    ctx.fillStyle = 'rgba(0,0,0,0.45)'; ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 28px sans-serif';
+    ctx.fillText('正解するまで動けない！', W/2, 130);
+    ctx.fillStyle = '#ffd166'; ctx.font = 'bold 56px sans-serif';
+    ctx.fillText(p.text + ' = ?', W/2, 210);
+    const ch = p.choices || [], bw = 150, gap = 20, total = ch.length * bw + (ch.length - 1) * gap;
+    const sx = (W - total) / 2;
+    ch.forEach((c, i) => Game.btn(sx + i * (bw + gap), 250, bw, 84, String(c), () => Game.answerMath(localF, c), { color:'#2e8b57', font:38 }));
+    if (localF.mathWrongFlash > 0) { ctx.fillStyle = '#ff6b6b'; ctx.font = 'bold 24px sans-serif'; ctx.fillText('✗ 不正解！次の問題へ', W/2, 380); }
+  }
+  // 自分がmathキャラで対象選択中 → 相手を選ぶ
+  if (localF.mathSelecting) {
+    const opp = world.fighters.filter(f => f !== localF && !f.dead);
+    ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.font = 'bold 30px sans-serif';
+    ctx.fillText('🧮 誰に算数を出す？', W/2, 170);
+    const bw = 220, gap = 20, total = opp.length * bw + (opp.length - 1) * gap;
+    const sx = (W - total) / 2;
+    opp.forEach((o, i) => {
+      const sel = (((localF.mathTargetIdx % opp.length) + opp.length) % opp.length) === i;
+      Game.btn(sx + i * (bw + gap), 220, bw, 90, o.label + ' / ' + o.def.name, () => Game.chooseMathTarget(localF, opp, i), { color: sel ? '#7a5fae' : '#4a3a6a', font:22 });
+    });
+    Game.btn(W/2 - 100, 350, 200, 56, 'キャンセル', () => { localF.mathSelecting = false; }, { font:22 });
+  }
+}
+// キャラ選択プレビュー用の簡易棒人間
+function drawPreviewFighter(ctx, x, y, charId, color) {
+  if (charId === 'chara_banana') {
+    ctx.save(); ctx.translate(x, y);
+    const HW = 12, H = 60;
+    const grad = ctx.createLinearGradient(-HW, 0, HW, 0);
+    grad.addColorStop(0, '#d9a915'); grad.addColorStop(0.45, '#ffe14d'); grad.addColorStop(1, '#caa00f');
+    ctx.fillStyle = grad; ctx.strokeStyle = '#6e5300'; ctx.lineWidth = 3; ctx.lineJoin = 'round';
+    roundRect(ctx, -HW, -H, HW * 2, H, HW); ctx.fill(); ctx.stroke();
+    ctx.strokeStyle = '#5a4500'; ctx.lineWidth = 5; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(0, -H); ctx.lineTo(0, -H - 8); ctx.stroke();
+    ctx.fillStyle = '#3a2a00';
+    ctx.beginPath(); ctx.arc(-4, -H + 18, 2.4, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(4, -H + 18, 2.4, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+    return;
+  }
+  ctx.save(); ctx.translate(x, y); ctx.strokeStyle = color; ctx.lineWidth = 3; ctx.lineCap = 'round';
+  drawLeg(ctx, -5, -25, 8, 8, 13, 12);
+  drawLeg(ctx, 5, -25, -8, 8, 13, 12);
+  ctx.beginPath(); ctx.moveTo(0, -25); ctx.lineTo(0, -53); ctx.stroke();
+  drawArm(ctx, 0, -49, 25, 20); drawArm(ctx, 0, -49, -25, 20);
+  ctx.beginPath(); ctx.arc(0, -65, 12, 0, Math.PI*2); ctx.stroke();
+  ctx.restore();
+}
+
+/* ======================= 14. 起動 ======================= */
+window.SunmaGame = Game;
+// net.js（別スクリプト）から参照するデータを公開
+window.SunmaData = { CHARS, CHAR_ORDER, COLORS, STAGES, RemoteController };
+// load イベントを待たずに確実に起動（タイミング差で初期化漏れ＝グレー画面になるのを防ぐ）
+function bootSunma() {
+  if (Game._booted) return;
+  try {
+    if (!document.getElementById('game')) { setTimeout(bootSunma, 30); return; }
+    Game._booted = true;
+    Game.init();
+  } catch (err) {
+    Game._booted = false;
+    console.error('[スンマ戦] init error:', err);
+    const cv = document.getElementById('game');
+    if (cv) {
+      const ctx = cv.getContext('2d');
+      ctx.fillStyle = '#220000'; ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = '#ff6b6b'; ctx.font = 'bold 24px monospace';
+      ctx.fillText('初期化エラー: ' + (err.message || err), 40, 80);
+    }
+  }
+}
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bootSunma);
+else bootSunma();
+window.addEventListener('load', bootSunma);
+
+</script>
+</body>
+</html>
